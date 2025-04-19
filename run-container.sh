@@ -66,11 +66,16 @@ validate_input() {
     return 0
 }
 
-# Function to build the Docker image
-build_image() {
-    print_message "$YELLOW" "Building Docker image..."
-    docker build -t node-group-manager . &
-    show_progress $! "Building Docker image"
+# Function to ensure image is available
+ensure_image() {
+    print_message "$YELLOW" "Checking for Docker image..."
+    if ! docker image inspect jjjulllesss/wake-up-cloud:latest >/dev/null 2>&1; then
+        print_message "$YELLOW" "Pulling Docker image..."
+        docker pull jjjulllesss/wake-up-cloud:latest &
+        show_progress $! "Pulling Docker image"
+    else
+        print_message "$GREEN" "Docker image already available"
+    fi
 }
 
 # Function to run the container
@@ -88,13 +93,13 @@ run_container() {
             -e AWS_SECRET_ACCESS_KEY \
             -e AWS_SESSION_TOKEN \
             -v /tmp:/tmp \
-            node-group-manager "$@"
+            jjjulllesss/wake-up-cloud:latest "$@"
     elif [ "$cloud_provider" = "gcp" ]; then
         docker run -it --rm \
             -v ~/.config/gcloud:/home/appuser/.config/gcloud:ro \
             -e GOOGLE_APPLICATION_CREDENTIALS=/home/appuser/.config/gcloud/application_default_credentials.json \
             -v /tmp:/tmp \
-            node-group-manager "$@"
+            jjjulllesss/wake-up-cloud:latest "$@"
     else
         print_message "$RED" "Error: Unsupported cloud provider: $cloud_provider"
         exit 1
@@ -176,8 +181,8 @@ main() {
         fi
     fi
 
-    # Build the image
-    build_image
+    # Ensure image is available
+    ensure_image
 
     # Run the container
     run_container "$cloud_provider" "${args[@]}"

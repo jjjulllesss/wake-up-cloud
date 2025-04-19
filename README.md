@@ -15,7 +15,7 @@ chmod +x run-container.sh
 ```
 
 The script will automatically:
-- Build the Docker image
+- Pull the Docker image if not already present
 - Detect the cloud provider (or use the one you specify)
 - Mount the appropriate credentials
 - Run the container with proper logging
@@ -72,40 +72,48 @@ All logs are:
 
 For issues or questions, please check the log file in `/tmp` for detailed error information.
 
-## Multi-Architecture Docker Images
+## Docker Image
 
-The Node Group Manager is available as a multi-architecture Docker image supporting both `amd64` and `arm64` platforms. The images are automatically built and pushed to Docker Hub on every push to the main branch and when tags are created.
+The Node Group Manager is available as a multi-architecture Docker image supporting both `amd64` and `arm64` platforms. The image is automatically built and pushed to Docker Hub on every push to the main branch and when tags are created.
 
-### Pulling the Image
+### Image Details
+- Repository: `jjjulllesss/wake-up-cloud`
+- Architectures: `amd64`, `arm64`
+- Size: ~150MB
+- Auto-updates: On every main branch push and tag
 
+### Manual Pull
+
+If you want to manually pull the image:
 ```bash
-# Pull the latest image
-docker pull yourusername/node-group-manager:latest
+# Pull the latest version
+docker pull jjjulllesss/wake-up-cloud:latest
 
 # Pull a specific version
-docker pull yourusername/node-group-manager:v1.0.0
+docker pull jjjulllesss/wake-up-cloud:v1.0.0
 ```
 
-### Running on Different Architectures
+### Running Manually
 
-The image will automatically use the correct architecture for your system:
-
-- **AMD64 (x86_64)**: Standard Intel/AMD processors
-- **ARM64**: Apple Silicon (M1/M2) and other ARM-based processors
-
-### Building Locally
-
-To build the multi-arch image locally:
+You can also run the container directly with Docker:
 
 ```bash
-# Set up Docker Buildx
-docker buildx create --use
+# For AWS
+docker run -it --rm \
+    -v ~/.aws:/home/appuser/.aws:ro \
+    -e AWS_DEFAULT_REGION \
+    -e AWS_ACCESS_KEY_ID \
+    -e AWS_SECRET_ACCESS_KEY \
+    -e AWS_SESSION_TOKEN \
+    -v /tmp:/tmp \
+    jjjulllesss/wake-up-cloud:latest --cluster-name my-cluster --cloud aws --account 123456789012
 
-# Build for both architectures
-docker buildx build --platform linux/amd64,linux/arm64 -t yourusername/node-group-manager:latest .
-
-# Push to Docker Hub
-docker buildx build --platform linux/amd64,linux/arm64 -t yourusername/node-group-manager:latest --push .
+# For GCP
+docker run -it --rm \
+    -v ~/.config/gcloud:/home/appuser/.config/gcloud:ro \
+    -e GOOGLE_APPLICATION_CREDENTIALS=/home/appuser/.config/gcloud/application_default_credentials.json \
+    -v /tmp:/tmp \
+    jjjulllesss/wake-up-cloud:latest --cluster-name my-cluster --cloud gcp --account my-project
 ```
 
 ### Image Size Optimization
