@@ -53,7 +53,8 @@ COPY run-container.sh .
 # Set up non-root user
 RUN useradd -m -u 1000 appuser && \
     mkdir -p /home/appuser/.aws /home/appuser/.config/gcloud && \
-    chown -R appuser:appuser /home/appuser /app
+    chown -R appuser:appuser /home/appuser /app && \
+    chmod +x /app/run.sh
 
 # Set up environment
 ENV PATH="/usr/local/aws-cli/v2/current/bin:${PATH}"
