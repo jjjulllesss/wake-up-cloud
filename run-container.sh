@@ -39,9 +39,16 @@ show_progress() {
 
 # Function to check if running in a cloud shell
 is_cloud_shell() {
-    if [ -n "$AWS_CLOUD_SHELL" ] || [ -n "$CLOUD_SHELL" ]; then
+    # Check for AWS CloudShell
+    if [ "$HOME" = "/home/cloudshell-user" ]; then
         return 0
     fi
+    
+    # Check for GCP CloudShell
+    if [ -n "$CLOUD_SHELL" ]; then
+        return 0
+    fi
+    
     return 1
 }
 
@@ -50,6 +57,16 @@ validate_credentials() {
     local cloud_provider=$1
     
     if [ "$cloud_provider" = "aws" ]; then
+        # Check for AWS CloudShell role
+        if [ "$HOME" = "/home/cloudshell-user" ]; then
+            if [ -n "$AWS_ROLE_ARN" ]; then
+                print_message "$GREEN" "Using AWS CloudShell role: $AWS_ROLE_ARN"
+            else
+                print_message "$GREEN" "Using AWS CloudShell credentials"
+            fi
+            return 0
+        fi
+        
         # Check for AWS credentials in environment variables
         if [ -n "$AWS_ACCESS_KEY_ID" ] && [ -n "$AWS_SECRET_ACCESS_KEY" ]; then
             print_message "$GREEN" "Using AWS credentials from environment variables"
@@ -72,7 +89,7 @@ validate_credentials() {
         print_message "$RED" "Error: No AWS credentials found"
         print_message "$YELLOW" "Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables"
         print_message "$YELLOW" "Or configure ~/.aws/credentials file"
-        print_message "$YELLOW" "Optional: Set AWS_SESSION_TOKEN for temporary credentials"
+        print_message "$YELLOW" "Or use AWS CloudShell with an attached role"
         return 1
     elif [ "$cloud_provider" = "gcp" ]; then
         # Check for GCP credentials file
@@ -182,23 +199,33 @@ run_container() {
 
     # Add AWS-specific environment variables and mounts
     if [ "$cloud_provider" = "aws" ]; then
-        # Add AWS environment variables if they exist
-        if [ -n "$AWS_ACCESS_KEY_ID" ]; then
-            docker_args+=("-e" "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID")
-        fi
-        if [ -n "$AWS_SECRET_ACCESS_KEY" ]; then
-            docker_args+=("-e" "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY")
-        fi
-        if [ -n "$AWS_SESSION_TOKEN" ]; then
-            docker_args+=("-e" "AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN")
-        fi
-        if [ -n "$AWS_DEFAULT_REGION" ]; then
-            docker_args+=("-e" "AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION")
-        fi
+        # Add network mode host for CloudShell compatibility
+        docker_args+=("--network=host")
         
-        # Mount AWS credentials directory if it exists
-        if [ -d ~/.aws ]; then
-            docker_args+=("-v" "$HOME/.aws:/root/.aws:ro")
+        # In CloudShell, we don't need to pass credentials as they're automatically available
+        if [ "$HOME" = "/home/cloudshell-user" ]; then
+            print_message "$GREEN" "Using AWS CloudShell session role"
+            # Ensure container can access instance metadata
+            docker_args+=("--add-host=metadata:169.254.169.254")
+        else
+            # Add AWS environment variables if they exist
+            if [ -n "$AWS_ACCESS_KEY_ID" ]; then
+                docker_args+=("-e" "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID")
+            fi
+            if [ -n "$AWS_SECRET_ACCESS_KEY" ]; then
+                docker_args+=("-e" "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY")
+            fi
+            if [ -n "$AWS_SESSION_TOKEN" ]; then
+                docker_args+=("-e" "AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN")
+            fi
+            if [ -n "$AWS_DEFAULT_REGION" ]; then
+                docker_args+=("-e" "AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION")
+            fi
+            
+            # Mount AWS credentials directory if it exists
+            if [ -d ~/.aws ]; then
+                docker_args+=("-v" "$HOME/.aws:/root/.aws:ro")
+            fi
         fi
     fi
 
@@ -217,8 +244,12 @@ run_container() {
     local cmd_args=(
         "--cluster-name" "$CLUSTER_NAME"
         "--cloud" "$CLOUD_PROVIDER"
-        "--account" "$ACCOUNT"
     )
+
+    # Add account argument if provided (required for GCP, optional for AWS)
+    if [ -n "$ACCOUNT" ]; then
+        cmd_args+=("--account" "$ACCOUNT")
+    fi
 
     # Add optional arguments
     if [ -n "$REGION" ]; then

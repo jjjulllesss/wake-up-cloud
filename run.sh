@@ -19,8 +19,14 @@ main() {
     local verbose=${VERBOSE:-false}
 
     # Check required arguments
-    if [ -z "$cluster_name" ] || [ -z "$cloud_provider" ] || [ -z "$account" ]; then
-        log_json "ERROR" "Missing required arguments. CLUSTER_NAME, CLOUD_PROVIDER, and ACCOUNT must be set."
+    if [ -z "$cluster_name" ] || [ -z "$cloud_provider" ]; then
+        log_json "ERROR" "Missing required arguments. CLUSTER_NAME and CLOUD_PROVIDER must be set."
+        exit 1
+    fi
+    
+    # Account is required for GCP
+    if [ "$cloud_provider" = "gcp" ] && [ -z "$account" ]; then
+        log_json "ERROR" "Missing required argument. ACCOUNT must be set for GCP."
         exit 1
     fi
 
@@ -28,8 +34,12 @@ main() {
     local cmd_args=(
         "--cluster-name" "$cluster_name"
         "--cloud" "$cloud_provider"
-        "--account" "$account"
     )
+
+    # Add account argument if provided (required for GCP, optional for AWS)
+    if [ -n "$account" ]; then
+        cmd_args+=("--account" "$account")
+    fi
 
     # Add optional arguments
     if [ -n "$region" ]; then

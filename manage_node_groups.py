@@ -99,13 +99,13 @@ class ValidationError(Exception):
 class NodeGroupManager:
     """Main class for managing node groups across cloud providers."""
     
-    def __init__(self, cluster_name: str, cloud_provider: str, account: str, region: str = None, dry_run: bool = False):
+    def __init__(self, cluster_name: str, cloud_provider: str, account: str = None, region: str = None, dry_run: bool = False):
         """Initialize the node group manager.
         
         Args:
             cluster_name: Name of the Kubernetes cluster
             cloud_provider: Cloud provider ('aws' or 'gcp')
-            account: AWS account ID or GCP project ID
+            account: AWS account ID or GCP project ID (required for GCP)
             region: AWS region (required for AWS)
             dry_run: If True, only show what would be changed
         """
@@ -145,20 +145,11 @@ class NodeGroupManager:
         if not self.cluster_name:
             raise ValidationError("Cluster name cannot be empty")
         
-        if not self.account:
-            raise ValidationError("Account/Project cannot be empty")
-
-        # Validate AWS account ID format (12 digits)
-        if self.cloud_provider == CloudProvider.AWS:
-            if not re.match(r'^\d{12}$', self.account):
-                raise ValidationError("AWS account ID must be 12 digits")
-            if not self.region:
-                raise ValidationError("AWS region is required")
-
-        # Validate GCP project ID format
-        if self.cloud_provider == CloudProvider.GCP:
-            if not re.match(r'^[a-z][a-z0-9-]{4,28}[a-z0-9]$', self.account):
-                raise ValidationError("Invalid GCP project ID format")
+        if self.cloud_provider == CloudProvider.GCP and not self.account:
+            raise ValidationError("GCP project ID is required")
+        
+        if self.cloud_provider == CloudProvider.AWS and not self.region:
+            raise ValidationError("AWS region is required")
 
     def manage_node_groups(self) -> None:
         """Main method to manage node groups.
@@ -284,15 +275,30 @@ class NodeGroupManager:
         """Get an AWS client for the specified service.
         
         Args:
-            service_name: The AWS service name (e.g., 'ec2', 'autoscaling')
+            service_name: Name of the AWS service
             
         Returns:
-            An AWS client for the specified service
+            boto3.client: AWS client for the specified service
+            
+        Raises:
+            Exception: If client creation fails
         """
         logger.info("Creating AWS client for service: %s", service_name)
         try:
-            # Use default session with specified region
-            return boto3.client(service_name, region_name=self.region)
+            # Create a session to use the default credential provider chain
+            session = boto3.Session()
+            
+            # Log which credential source is being used
+            credentials = session.get_credentials()
+            if credentials.token:
+                logger.info("Using AWS session credentials (likely from CloudShell)")
+            elif credentials.access_key:
+                logger.info("Using AWS access key credentials")
+            else:
+                logger.info("Using default AWS credential provider chain")
+            
+            # Create client with the session
+            return session.client(service_name, region_name=self.region)
         except Exception as e:
             logger.error(f"Failed to create AWS {service_name} client: {str(e)}")
             raise
@@ -629,8 +635,7 @@ def main():
     )
     parser.add_argument(
         '--account',
-        required=True,
-        help='AWS account ID or GCP project ID'
+        help='AWS account ID or GCP project ID (required for GCP)'
     )
     
     # Optional arguments

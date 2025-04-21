@@ -14,9 +14,13 @@ WORKDIR /app
 # Copy only the necessary files
 COPY manage_node_groups.py .
 COPY requirements.txt .
+COPY run.sh .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Set the entrypoint
-ENTRYPOINT ["python", "manage_node_groups.py"] 
+# Make run.sh executable
+RUN chmod +x run.sh
+
+# Set the command
+CMD ["./run.sh"] 
