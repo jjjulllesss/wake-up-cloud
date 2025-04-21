@@ -214,7 +214,7 @@ run_container() {
     fi
 
     # Run the container
-    docker run "${docker_args[@]}" node-group-manager "$@"
+    docker run "${docker_args[@]}" jjjulllesss/wake-up-cloud "$@"
 }
 
 # Function to show help

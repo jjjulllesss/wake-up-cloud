@@ -10,16 +10,41 @@ log_json() {
 
 # Main script
 main() {
-    # Get cloud provider from environment
+    # Get required environment variables
+    local cluster_name=${CLUSTER_NAME:-}
     local cloud_provider=${CLOUD_PROVIDER:-}
-    if [ -z "$cloud_provider" ]; then
-        log_json "ERROR" "CLOUD_PROVIDER environment variable not set"
+    local account=${ACCOUNT:-}
+    local region=${REGION:-}
+    local dry_run=${DRY_RUN:-false}
+    local verbose=${VERBOSE:-false}
+
+    # Check required arguments
+    if [ -z "$cluster_name" ] || [ -z "$cloud_provider" ] || [ -z "$account" ]; then
+        log_json "ERROR" "Missing required arguments. CLUSTER_NAME, CLOUD_PROVIDER, and ACCOUNT must be set."
         exit 1
     fi
 
-    # Run the Python script with all arguments
-    python manage_node_groups.py "$@"
+    # Build command arguments
+    local cmd_args=(
+        "--cluster-name" "$cluster_name"
+        "--cloud" "$cloud_provider"
+        "--account" "$account"
+    )
+
+    # Add optional arguments
+    if [ -n "$region" ]; then
+        cmd_args+=("--region" "$region")
+    fi
+    if [ "$dry_run" = "true" ]; then
+        cmd_args+=("--dry-run")
+    fi
+    if [ "$verbose" = "true" ]; then
+        cmd_args+=("--verbose")
+    fi
+
+    # Run the Python script with arguments
+    python manage_node_groups.py "${cmd_args[@]}"
 }
 
-# Execute main function with all arguments
+# Execute main function
 main "$@" 
