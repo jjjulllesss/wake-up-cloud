@@ -213,8 +213,26 @@ run_container() {
         docker_args+=("--network=host")
     fi
 
-    # Run the container
-    docker run "${docker_args[@]}" jjjulllesss/wake-up-cloud "$@"
+    # Build command arguments for the container
+    local cmd_args=(
+        "--cluster-name" "$CLUSTER_NAME"
+        "--cloud" "$CLOUD_PROVIDER"
+        "--account" "$ACCOUNT"
+    )
+
+    # Add optional arguments
+    if [ -n "$REGION" ]; then
+        cmd_args+=("--region" "$REGION")
+    fi
+    if [ "$DRY_RUN" = "true" ]; then
+        cmd_args+=("--dry-run")
+    fi
+    if [ "$VERBOSE" = "true" ]; then
+        cmd_args+=("--verbose")
+    fi
+
+    # Run the container with arguments
+    docker run "${docker_args[@]}" jjjulllesss/wake-up-cloud "${cmd_args[@]}"
 }
 
 # Function to show help
