@@ -1,76 +1,191 @@
-# Node Group Manager - Cloud Shell Edition
+# Node Group Manager
 
-A tool to manage Kubernetes node groups in AWS and GCP clusters, optimized for cloud shell environments.
+A tool to manage Kubernetes node group scaling for AWS and GCP clusters.
 
 ## Quick Start
 
-1. Make the script executable:
+1. Make sure you have Docker installed
+2. Make the setup script executable:
+   ```bash
+   chmod +x run-container.sh
+   ```
+3. Run the tool using either command line arguments or environment variables:
+
+### Using Command Line Arguments with Credential Files
 ```bash
-chmod +x run-container.sh
+./run-container.sh --cluster-name my-cluster --cloud aws --account 123456789012
 ```
 
-2. Run the tool:
+### Using Environment Variables with Credentials
 ```bash
-./run-container.sh --cluster-name <cluster-name> --cloud <aws|gcp> --account <account-id>
+# Set AWS credentials
+export AWS_ACCESS_KEY_ID=your_access_key
+export AWS_SECRET_ACCESS_KEY=your_secret_key
+export AWS_DEFAULT_REGION=us-east-1
+
+# Set tool configuration
+export CLUSTER_NAME=my-cluster
+export CLOUD_PROVIDER=aws
+export ACCOUNT=123456789012
+export DRY_RUN=true
+
+# Run the tool
+./run-container.sh
 ```
-
-The script will automatically:
-- Pull the Docker image if not already present
-- Detect the cloud provider (or use the one you specify)
-- Mount the appropriate credentials
-- Run the container with proper logging
-
-## Examples
-
-### AWS Example
-```bash
-./run-container.sh --cluster-name my-eks-cluster --cloud aws --account 123456789012 --dry-run
-```
-
-### GCP Example
-```bash
-./run-container.sh --cluster-name my-gke-cluster --cloud gcp --account my-gcp-project --dry-run
-```
-
-## Logging
-
-All logs are:
-- Displayed in real-time in the terminal
-- Saved to a log file in `/tmp/node_group_manager_YYYYMMDD_HHMMSS.log`
-- Include both stdout and stderr
-- Show the cloud provider detection and configuration
 
 ## Features
 
-- Automatic cloud provider detection
-- Secure credential handling
-- Comprehensive logging
-- Dry-run mode support
-- Verbose output option
-- Error handling and reporting
+- Supports both AWS and GCP cloud providers
+- Flexible credential management:
+  - Environment variables
+  - Credential files
+  - Automatic credential detection
+- Dry run mode for safe testing
+- Flexible tag format parsing
+- Automatic role assumption (AWS)
+- Operation waiting and validation
+
+## Configuration
+
+### Environment Variables
+
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `CLUSTER_NAME` | Name of the Kubernetes cluster | Yes |
+| `CLOUD_PROVIDER` | Cloud provider (aws or gcp) | Yes |
+| `ACCOUNT` | AWS account ID or GCP project ID | Yes |
+| `REGION` | AWS region (required for AWS) | Yes (AWS only) |
+| `DRY_RUN` | Set to 'true' for dry run mode | No |
+| `VERBOSE` | Set to 'true' for verbose output | No |
+
+### AWS Credentials
+
+You can provide AWS credentials in two ways:
+
+1. **Environment Variables**:
+   ```bash
+   export AWS_ACCESS_KEY_ID=your_access_key
+   export AWS_SECRET_ACCESS_KEY=your_secret_key
+   export AWS_SESSION_TOKEN=your_session_token  # Optional
+   export AWS_DEFAULT_REGION=us-east-1
+   ```
+
+2. **Credential File**:
+   Place your credentials in `~/.aws/credentials`:
+   ```ini
+   [default]
+   aws_access_key_id = your_access_key
+   aws_secret_access_key = your_secret_key
+   region = us-east-1
+   ```
+
+### GCP Credentials
+
+You can provide GCP credentials in two ways:
+
+1. **Environment Variable**:
+   ```bash
+   export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
+   ```
+
+2. **Credential File**:
+   Place your credentials in `~/.config/gcloud/application_default_credentials.json`
+
+## Usage
+
+### AWS Example
+
+```bash
+# Using environment variables for credentials
+export AWS_ACCESS_KEY_ID=your_access_key
+export AWS_SECRET_ACCESS_KEY=your_secret_key
+export AWS_DEFAULT_REGION=us-east-1
+export CLUSTER_NAME=my-cluster
+export CLOUD_PROVIDER=aws
+export ACCOUNT=123456789012
+export DRY_RUN=true
+./run-container.sh
+
+# Using credential files
+./run-container.sh \
+  --cluster-name my-cluster \
+  --cloud aws \
+  --account 123456789012 \
+  --region us-east-1 \
+  --dry-run
+```
+
+### GCP Example
+
+```bash
+# Using environment variables for credentials
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
+export CLUSTER_NAME=my-cluster
+export CLOUD_PROVIDER=gcp
+export ACCOUNT=my-project-id
+export DRY_RUN=true
+./run-container.sh
+
+# Using credential files
+./run-container.sh \
+  --cluster-name my-cluster \
+  --cloud gcp \
+  --account my-project-id \
+  --dry-run
+```
+
+## CI/CD Integration
+
+The tool can be easily integrated into CI/CD pipelines using environment variables:
+
+```yaml
+# Example GitHub Actions workflow
+jobs:
+  manage-node-groups:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Manage Node Groups
+        env:
+          # Tool configuration
+          CLUSTER_NAME: ${{ secrets.CLUSTER_NAME }}
+          CLOUD_PROVIDER: ${{ secrets.CLOUD_PROVIDER }}
+          ACCOUNT: ${{ secrets.ACCOUNT }}
+          REGION: ${{ secrets.REGION }}
+          DRY_RUN: false
+          
+          # AWS credentials
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+        run: |
+          chmod +x run-container.sh
+          ./run-container.sh
+```
 
 ## Security
 
-- Runs as non-root user
-- Credentials mounted as read-only
-- No sensitive data stored in container
-- Temporary credentials used when available
+- The container runs as a non-root user
+- Credentials are mounted read-only from the host
+- No credentials are stored in the container
+- Environment variables are passed securely to the container
+- Credential files are mounted read-only
 
 ## Troubleshooting
 
-### AWS Issues
-- Ensure AWS credentials are configured
-- Check IAM permissions
-- Verify AWS region settings
+### AWS
+- Ensure your AWS credentials are properly configured
+- Check that you have the necessary IAM permissions
+- Verify the region is correct
 
-### GCP Issues
-- Ensure GCP credentials are configured
-- Check IAM permissions
-- Verify project ID
+### GCP
+- Ensure your GCP credentials are properly configured
+- Check that you have the necessary IAM permissions
+- Verify the project ID is correct
 
 ## Support
 
-For issues or questions, please check the log file in `/tmp` for detailed error information.
+For detailed error information, check the logs in `/tmp/node_group_manager/`.
 
 ## Docker Image
 

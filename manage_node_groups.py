@@ -26,18 +26,47 @@ import os
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 from enum import Enum
+from logging.handlers import RotatingFileHandler
 
 import boto3
 from botocore.exceptions import ClientError
 from google.cloud import container_v1
 from google.api_core import exceptions as google_exceptions
 
-# Configure logging with timestamp and level
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+# Configure logging
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# Create log directory if it doesn't exist
+log_dir = "/tmp/node_group_manager"
+os.makedirs(log_dir, exist_ok=True)
+
+# Set up file handler with rotation
+log_file = os.path.join(log_dir, "node_group_manager.log")
+file_handler = RotatingFileHandler(
+    log_file,
+    maxBytes=10*1024*1024,  # 10MB
+    backupCount=5
+)
+file_handler.setFormatter(logging.Formatter(
+    '%(asctime)s - %(levelname)s - %(message)s'
+))
+
+# Set up console handler
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter(
+    '%(asctime)s - %(levelname)s - %(message)s'
+))
+
+# Add handlers to logger
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+
+# Log startup information
+logger.info("Starting Node Group Manager")
+logger.info("Log file: %s", log_file)
+logger.info("Python version: %s", sys.version)
+logger.info("Working directory: %s", os.getcwd())
 
 class CloudProvider(Enum):
     """Supported cloud providers."""
@@ -70,21 +99,33 @@ class ValidationError(Exception):
 class NodeGroupManager:
     """Main class for managing node groups across cloud providers."""
     
-    def __init__(self, cluster_name: str, cloud_provider: str, account: str, dry_run: bool = False):
+    def __init__(self, cluster_name: str, cloud_provider: str, account: str, region: str = None, dry_run: bool = False):
         """Initialize the node group manager.
         
         Args:
             cluster_name: Name of the Kubernetes cluster
             cloud_provider: Cloud provider ('aws' or 'gcp')
             account: AWS account ID or GCP project ID
+            region: AWS region (required for AWS)
             dry_run: If True, only show what would be changed
         """
+        logger.info("Initializing NodeGroupManager")
+        logger.info("Cluster name: %s", cluster_name)
+        logger.info("Cloud provider: %s", cloud_provider)
+        logger.info("Account: %s", account)
+        logger.info("Region: %s", region)
+        logger.info("Dry run mode: %s", dry_run)
+        
         self.cluster_name = cluster_name
         self.cloud_provider = CloudProvider(cloud_provider.lower())
         self.account = account
+        self.region = region
         self.dry_run = dry_run
         self.operations: List[ScalingOperation] = []
+        
+        logger.info("Validating inputs...")
         self.validate_inputs()
+        logger.info("Input validation completed successfully")
 
     @property
     def tag_name(self) -> str:
@@ -111,6 +152,8 @@ class NodeGroupManager:
         if self.cloud_provider == CloudProvider.AWS:
             if not re.match(r'^\d{12}$', self.account):
                 raise ValidationError("AWS account ID must be 12 digits")
+            if not self.region:
+                raise ValidationError("AWS region is required")
 
         # Validate GCP project ID format
         if self.cloud_provider == CloudProvider.GCP:
@@ -237,40 +280,6 @@ class NodeGroupManager:
         if not min_size <= desired <= max_size:
             raise ValueError(f"Desired {desired} not between min {min_size} and max {max_size}")
 
-    def _assume_aws_role(self, role_name: str = "OrganizationAccountAccessRole") -> None:
-        """Assume an AWS IAM role in the target account.
-        
-        This method assumes a role in the target AWS account to perform operations.
-        It uses the AWS Security Token Service (STS) to get temporary credentials.
-        
-        Args:
-            role_name: Name of the role to assume (default: OrganizationAccountAccessRole)
-            
-        Raises:
-            ClientError: If role assumption fails
-        """
-        try:
-            sts = boto3.client('sts')
-            role_arn = f"arn:aws:iam::{self.account}:role/{role_name}"
-            
-            response = sts.assume_role(
-                RoleArn=role_arn,
-                RoleSessionName='NodeGroupManagerSession'
-            )
-            
-            # Set up the session with temporary credentials
-            credentials = response['Credentials']
-            boto3.setup_default_session(
-                aws_access_key_id=credentials['AccessKeyId'],
-                aws_secret_access_key=credentials['SecretAccessKey'],
-                aws_session_token=credentials['SessionToken']
-            )
-            logger.info(f"Successfully assumed role {role_name} in account {self.account}")
-            
-        except ClientError as e:
-            logger.error(f"Failed to assume role in account {self.account}: {str(e)}")
-            raise
-
     def _get_aws_client(self, service_name: str):
         """Get an AWS client for the specified service.
         
@@ -280,22 +289,10 @@ class NodeGroupManager:
         Returns:
             An AWS client for the specified service
         """
+        logger.info("Creating AWS client for service: %s", service_name)
         try:
-            # Check for session token in environment
-            session_token = os.environ.get('AWS_SESSION_TOKEN')
-            
-            if session_token:
-                # Use credentials from environment including session token
-                return boto3.client(
-                    service_name,
-                    aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
-                    aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
-                    aws_session_token=session_token
-                )
-            else:
-                # Use default session (which may include assumed role credentials)
-                return boto3.client(service_name)
-                
+            # Use default session with specified region
+            return boto3.client(service_name, region_name=self.region)
         except Exception as e:
             logger.error(f"Failed to create AWS {service_name} client: {str(e)}")
             raise
@@ -334,29 +331,38 @@ class NodeGroupManager:
         """Manage AWS Auto Scaling Groups for the specified cluster.
         
         This method:
-        1. Assumes the appropriate IAM role
-        2. Finds all ASGs matching the cluster name
-        3. Checks for OffHoursPrevious tags
-        4. Updates scaling parameters based on tag values
+        1. Finds all ASGs matching the cluster name
+        2. Checks for OffHoursPrevious tags
+        3. Updates scaling parameters based on tag values
         
         Raises:
             ClientError: If AWS API calls fail
             ValueError: If tag parsing fails
         """
         try:
-            # First assume role in target account
-            self._assume_aws_role()
+            logger.info(f"Starting AWS node group management for cluster: {self.cluster_name}")
+            logger.info(f"Using AWS region: {self.region}")
             
             # Get AWS clients
             autoscaling = self._get_aws_client('autoscaling')
             ec2 = self._get_aws_client('ec2')
             
             # Get all ASGs
+            logger.info("Fetching Auto Scaling Groups...")
             paginator = autoscaling.get_paginator('describe_auto_scaling_groups')
+            asg_count = 0
+            matching_asg_count = 0
+            
             for page in paginator.paginate():
                 for asg in page['AutoScalingGroups']:
+                    asg_count += 1
+                    asg_name = asg['AutoScalingGroupName']
+                    logger.debug(f"Found ASG: {asg_name}")
+                    
                     # Check if ASG name contains cluster name
-                    if self.cluster_name in asg['AutoScalingGroupName']:
+                    if self.cluster_name in asg_name:
+                        matching_asg_count += 1
+                        logger.info(f"Found matching ASG: {asg_name}")
                         try:
                             off_hours_previous = None
                             
@@ -364,16 +370,16 @@ class NodeGroupManager:
                             for tag in asg['Tags']:
                                 if tag['Key'] == self.tag_name:
                                     off_hours_previous = tag['Value']
+                                    logger.info(f"Found {self.tag_name} tag with value: {off_hours_previous}")
                                     break
                             
                             if off_hours_previous:
-                                logger.info(f"Found {self.tag_name} tag for ASG: {asg['AutoScalingGroupName']}")
                                 try:
                                     max_size, desired_capacity, min_size = self._parse_scaling_values(off_hours_previous)
                                     
                                     # Add operation to the list
                                     operation = ScalingOperation(
-                                        resource_name=asg['AutoScalingGroupName'],
+                                        resource_name=asg_name,
                                         current_size=asg['DesiredCapacity'],
                                         target_size=desired_capacity,
                                         min_size=min_size,
@@ -384,21 +390,30 @@ class NodeGroupManager:
                                     
                                     # Execute operation if not in dry run mode
                                     if not self.dry_run:
-                                        logger.info(f"Updating scaling parameters for ASG: {asg['AutoScalingGroupName']}")
+                                        logger.info(f"Updating scaling parameters for ASG: {asg_name}")
                                         autoscaling.update_auto_scaling_group(
-                                            AutoScalingGroupName=asg['AutoScalingGroupName'],
+                                            AutoScalingGroupName=asg_name,
                                             MinSize=min_size,
                                             MaxSize=max_size,
                                             DesiredCapacity=desired_capacity
                                         )
-                                        logger.info(f"Successfully updated scaling parameters for {asg['AutoScalingGroupName']}")
+                                        logger.info(f"Successfully updated scaling parameters for {asg_name}")
                                     
                                 except ValueError as e:
-                                    logger.error(f"Error parsing scaling values for ASG {asg['AutoScalingGroupName']}: {str(e)}")
+                                    logger.error(f"Error parsing scaling values for ASG {asg_name}: {str(e)}")
                                     continue
+                            else:
+                                logger.info(f"No {self.tag_name} tag found for ASG: {asg_name}")
                             
                         except ClientError as e:
-                            logger.error(f"Error processing ASG {asg['AutoScalingGroupName']}: {str(e)}")
+                            logger.error(f"Error processing ASG {asg_name}: {str(e)}")
+                    else:
+                        logger.debug(f"Skipping non-matching ASG: {asg_name}")
+            
+            logger.info(f"Processed {asg_count} total ASGs")
+            logger.info(f"Found {matching_asg_count} ASGs matching cluster name: {self.cluster_name}")
+            if matching_asg_count == 0:
+                logger.warning(f"No ASGs found matching cluster name: {self.cluster_name}")
                         
         except ClientError as e:
             logger.error(f"AWS API error: {str(e)}")
@@ -620,14 +635,13 @@ def main():
     
     # Optional arguments
     parser.add_argument(
+        '--region',
+        help='AWS region (required for AWS)'
+    )
+    parser.add_argument(
         '--dry-run',
         action='store_true',
         help='Show what would be changed without making actual changes'
-    )
-    parser.add_argument(
-        '--role-name',
-        default='OrganizationAccountAccessRole',
-        help='AWS role name to assume (AWS only)'
     )
     parser.add_argument(
         '--verbose', '-v',
@@ -649,6 +663,7 @@ def main():
             cluster_name=args.cluster_name,
             cloud_provider=args.cloud,
             account=args.account,
+            region=args.region,
             dry_run=args.dry_run
         )
         manager.manage_node_groups()
