@@ -23,6 +23,7 @@ import sys
 import time
 import re
 import os
+import tempfile
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 from enum import Enum
@@ -37,8 +38,8 @@ from google.api_core import exceptions as google_exceptions
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Create log directory if it doesn't exist
-log_dir = "/tmp/node_group_manager"
+# Create log directory if it doesn't exist (cross-platform)
+log_dir = os.path.join(tempfile.gettempdir(), "node_group_manager")
 os.makedirs(log_dir, exist_ok=True)
 
 # Set up file handler with rotation
@@ -404,6 +405,19 @@ class NodeGroupManager:
                                             DesiredCapacity=desired_capacity
                                         )
                                         logger.info(f"Successfully updated scaling parameters for {asg_name}")
+                                        
+                                        # Remove the OffHoursPrevious tag after successful update
+                                        logger.info(f"Removing {self.tag_name} tag from ASG: {asg_name}")
+                                        autoscaling.delete_tags(
+                                            Tags=[
+                                                {
+                                                    'ResourceId': asg_name,
+                                                    'ResourceType': 'auto-scaling-group',
+                                                    'Key': self.tag_name
+                                                }
+                                            ]
+                                        )
+                                        logger.info(f"Successfully removed {self.tag_name} tag from {asg_name}")
                                     
                                 except ValueError as e:
                                     logger.error(f"Error parsing scaling values for ASG {asg_name}: {str(e)}")

@@ -1,241 +1,290 @@
 # Node Group Manager
 
-A tool to manage Kubernetes node group scaling for AWS and GCP clusters.
-
-## Quick Start
-
-1. Make sure you have Docker installed
-2. Make the setup script executable:
-   ```bash
-   chmod +x run-container.sh
-   ```
-3. Run the tool using either command line arguments or environment variables:
-
-### Using Command Line Arguments with Credential Files
-```bash
-./run-container.sh --cluster-name my-cluster --cloud aws --account 123456789012
-```
-
-### Using Environment Variables with Credentials
-```bash
-# Set AWS credentials
-export AWS_ACCESS_KEY_ID=your_access_key
-export AWS_SECRET_ACCESS_KEY=your_secret_key
-export AWS_DEFAULT_REGION=us-east-1
-
-# Set tool configuration
-export CLUSTER_NAME=my-cluster
-export CLOUD_PROVIDER=aws
-export ACCOUNT=123456789012
-export DRY_RUN=true
-
-# Run the tool
-./run-container.sh
-```
+A Python tool to manage Kubernetes node group scaling for AWS and GCP clusters. This script handles both AWS Auto Scaling Groups and GCP Node Pools, allowing you to restore previous scaling configurations based on tags/labels.
 
 ## Features
 
-- Supports both AWS and GCP cloud providers
-- Flexible credential management:
-  - Environment variables
-  - Credential files
-  - Automatic credential detection
-- Dry run mode for safe testing
-- Flexible tag format parsing
-- Automatic role assumption (AWS)
-- Operation waiting and validation
+- **Multi-Cloud Support**: Works with both AWS (EKS) and GCP (GKE) clusters
+- **Automatic Scaling Restoration**: Restores node group scaling parameters from stored tags/labels
+- **Dry Run Mode**: Test changes without making actual modifications
+- **Flexible Tag Parsing**: Supports multiple tag formats for different cloud providers
+- **Comprehensive Logging**: Detailed logging to both console and rotating log files
+- **Error Handling**: Robust error handling with detailed error messages
+- **Operation Validation**: Validates scaling parameters before applying changes
 
-## Configuration
+## Prerequisites
 
-### Environment Variables
+- Python 3.7 or higher
+- AWS CLI configured with appropriate credentials (for AWS)
+- GCP credentials configured (for GCP)
+- Required permissions to manage Auto Scaling Groups (AWS) or Node Pools (GCP)
 
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `CLUSTER_NAME` | Name of the Kubernetes cluster | Yes |
-| `CLOUD_PROVIDER` | Cloud provider (aws or gcp) | Yes |
-| `ACCOUNT` | AWS account ID or GCP project ID | Yes |
-| `REGION` | AWS region (required for AWS) | Yes (AWS only) |
-| `DRY_RUN` | Set to 'true' for dry run mode | No |
-| `VERBOSE` | Set to 'true' for verbose output | No |
+### AWS Permissions Required
 
-### AWS Credentials
+- `autoscaling:DescribeAutoScalingGroups`
+- `autoscaling:UpdateAutoScalingGroup`
+- `autoscaling:DeleteTags`
+- `ec2:DescribeInstances` (for some operations)
 
-You can provide AWS credentials in two ways:
+### GCP Permissions Required
 
-1. **Environment Variables**:
-   ```bash
-   export AWS_ACCESS_KEY_ID=your_access_key
-   export AWS_SECRET_ACCESS_KEY=your_secret_key
-   export AWS_SESSION_TOKEN=your_session_token  # Optional
-   export AWS_DEFAULT_REGION=us-east-1
-   ```
+- `container.clusters.get`
+- `container.clusters.list`
+- `container.nodePools.get`
+- `container.nodePools.update`
+- `container.operations.get`
 
-2. **Credential File**:
-   Place your credentials in `~/.aws/credentials`:
-   ```ini
-   [default]
-   aws_access_key_id = your_access_key
-   aws_secret_access_key = your_secret_key
-   region = us-east-1
-   ```
+## Installation
 
-### GCP Credentials
+### Quick Install (One-Line)
 
-You can provide GCP credentials in two ways:
+Download the script, install dependencies, and get started with a single command:
 
-1. **Environment Variable**:
-   ```bash
-   export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
-   ```
+```bash
+curl -sSL https://raw.githubusercontent.com/jjjulllesss/wake-up-cloud/main/manage_node_groups.py -o manage_node_groups.py && curl -sSL https://raw.githubusercontent.com/jjjulllesss/wake-up-cloud/main/requirements.txt -o requirements.txt && pip3 install -q -r requirements.txt && chmod +x manage_node_groups.py && echo "✅ Installation complete!\n" && python3 manage_node_groups.py --help
+```
 
-2. **Credential File**:
-   Place your credentials in `~/.config/gcloud/application_default_credentials.json`
+### Manual Installation
+
+1. Clone or download this repository
+
+2. Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Or using a virtual environment (recommended):
+
+```bash
+python3 -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
 
 ## Usage
+
+### Basic Usage
+
+```bash
+python manage_node_groups.py --cluster-name <cluster-name> --cloud <aws|gcp> [options]
+```
 
 ### AWS Example
 
 ```bash
-# Using environment variables for credentials
-export AWS_ACCESS_KEY_ID=your_access_key
-export AWS_SECRET_ACCESS_KEY=your_secret_key
-export AWS_DEFAULT_REGION=us-east-1
-export CLUSTER_NAME=my-cluster
-export CLOUD_PROVIDER=aws
-export ACCOUNT=123456789012
-export DRY_RUN=true
-./run-container.sh
-
-# Using credential files
-./run-container.sh \
-  --cluster-name my-cluster \
+python manage_node_groups.py \
+  --cluster-name my-eks-cluster \
   --cloud aws \
-  --account 123456789012 \
   --region us-east-1 \
-  --dry-run
+  --account 123456789012
 ```
 
 ### GCP Example
 
 ```bash
-# Using environment variables for credentials
-export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
-export CLUSTER_NAME=my-cluster
-export CLOUD_PROVIDER=gcp
-export ACCOUNT=my-project-id
-export DRY_RUN=true
-./run-container.sh
-
-# Using credential files
-./run-container.sh \
-  --cluster-name my-cluster \
+python manage_node_groups.py \
+  --cluster-name my-gke-cluster \
   --cloud gcp \
-  --account my-project-id \
+  --account my-gcp-project-id
+```
+
+### Dry Run Mode
+
+Test changes without making actual modifications:
+
+```bash
+python manage_node_groups.py \
+  --cluster-name my-cluster \
+  --cloud aws \
+  --region us-east-1 \
   --dry-run
 ```
 
-## CI/CD Integration
+### Verbose Logging
 
-The tool can be easily integrated into CI/CD pipelines using environment variables:
+Increase logging verbosity:
 
-```yaml
-# Example GitHub Actions workflow
-jobs:
-  manage-node-groups:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v2
-      - name: Manage Node Groups
-        env:
-          # Tool configuration
-          CLUSTER_NAME: ${{ secrets.CLUSTER_NAME }}
-          CLOUD_PROVIDER: ${{ secrets.CLOUD_PROVIDER }}
-          ACCOUNT: ${{ secrets.ACCOUNT }}
-          REGION: ${{ secrets.REGION }}
-          DRY_RUN: false
-          
-          # AWS credentials
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
-        run: |
-          chmod +x run-container.sh
-          ./run-container.sh
+```bash
+python manage_node_groups.py \
+  --cluster-name my-cluster \
+  --cloud aws \
+  --region us-east-1 \
+  -v      # INFO level
+  -vv     # DEBUG level
 ```
 
-## Security
+## Command Line Arguments
 
-- The container runs as a non-root user
-- Credentials are mounted read-only from the host
-- No credentials are stored in the container
-- Environment variables are passed securely to the container
-- Credential files are mounted read-only
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--cluster-name` | Yes | Name of the Kubernetes cluster to manage |
+| `--cloud` | Yes | Cloud provider: `aws` or `gcp` |
+| `--account` | GCP: Yes<br>AWS: Optional | AWS account ID or GCP project ID |
+| `--region` | AWS: Yes<br>GCP: No | AWS region (e.g., `us-east-1`) |
+| `--dry-run` | No | Show what would be changed without making changes |
+| `--verbose`, `-v` | No | Increase verbosity (can be used multiple times) |
+
+## Tag Format
+
+The script uses tags/labels to store and restore scaling configurations. The tag name differs by cloud provider:
+
+- **AWS**: `OffHoursPrevious`
+- **GCP**: `offhoursprevious`
+
+### AWS Tag Format
+
+```
+MaxSize=X;DesiredCapacity=Y;MinSize=Z
+```
+
+Example:
+```
+MaxSize=10;DesiredCapacity=5;MinSize=2
+```
+
+### GCP Tag Format
+
+```
+maxsizeX-desiredcapacityY-minsizeZ
+```
+
+Example:
+```
+maxsize10-desiredcapacity5-minsize2
+```
+
+### Tag Value Validation
+
+- All values must be non-negative integers
+- Maximum size cannot exceed 1000
+- Minimum size must be ≤ maximum size
+- Desired capacity must be between minimum and maximum size
+
+## How It Works
+
+### AWS (Auto Scaling Groups)
+
+1. The script searches for all Auto Scaling Groups in the specified region
+2. Filters ASGs matching the cluster name
+3. Looks for the `OffHoursPrevious` tag on each ASG
+4. Parses the tag value to extract scaling parameters
+5. Updates the ASG with the restored scaling parameters:
+   - `MinSize`
+   - `MaxSize`
+   - `DesiredCapacity`
+6. Removes the `OffHoursPrevious` tag after successful update
+
+### GCP (Node Pools)
+
+1. The script connects to the GKE API
+2. Lists all clusters in the project
+3. Finds the cluster matching the specified name
+4. For each node pool in the cluster:
+   - Checks for the `offhoursprevious` label
+   - Parses the label value to extract scaling parameters
+   - Updates the node pool with the restored configuration:
+     - Sets node count to desired capacity
+     - Enables autoscaling with min/max limits
+     - Removes the `offhoursprevious` label after processing
+
+## Logging
+
+The script logs to both console and file:
+
+- **Console**: Real-time output with timestamps
+- **File**: Rotating log files in `/tmp/node_group_manager/node_group_manager.log`
+  - Maximum file size: 10MB
+  - Backup count: 5 files
+  - Automatic rotation when size limit is reached
+
+## Error Handling
+
+The script includes comprehensive error handling:
+
+- **Validation Errors**: Invalid input parameters are caught and reported
+- **API Errors**: AWS/GCP API errors are logged with details
+- **Parsing Errors**: Invalid tag formats are reported with expected format examples
+- **Timeout Errors**: GCP operations have a default 600-second timeout
+
+## Examples
+
+### Restore Scaling for AWS Cluster
+
+```bash
+python manage_node_groups.py \
+  --cluster-name production-eks \
+  --cloud aws \
+  --region us-west-2 \
+  --account 123456789012
+```
+
+### Test GCP Scaling Changes
+
+```bash
+python manage_node_groups.py \
+  --cluster-name staging-gke \
+  --cloud gcp \
+  --account my-project-id \
+  --dry-run \
+  -vv
+```
 
 ## Troubleshooting
 
-### AWS
-- Ensure your AWS credentials are properly configured
-- Check that you have the necessary IAM permissions
-- Verify the region is correct
+### No ASGs Found Matching Cluster Name
 
-### GCP
-- Ensure your GCP credentials are properly configured
-- Check that you have the necessary IAM permissions
-- Verify the project ID is correct
+- Verify the cluster name is correct
+- Check that ASGs exist in the specified region
+- Ensure ASG names contain the cluster name as a substring
+
+### Tag Parsing Errors
+
+- Verify tag format matches the expected format for your cloud provider
+- Check that all three values (min, max, desired) are present
+- Ensure values are valid integers within acceptable ranges
+
+### Authentication Errors
+
+**AWS:**
+- Ensure AWS credentials are configured (`aws configure`)
+- Verify IAM permissions are sufficient
+- Check if using temporary credentials (CloudShell, etc.)
+
+**GCP:**
+- Ensure GCP credentials are configured (`gcloud auth application-default login`)
+- Verify service account has necessary permissions
+- Check project ID is correct
+
+### GCP Operation Timeouts
+
+- Increase timeout if operations take longer than 10 minutes
+- Check GCP console for any ongoing operations that might conflict
+- Verify network connectivity to GCP APIs
+
+## Development
+
+### Running Tests
+
+(Add test instructions if tests are added in the future)
+
+### Code Structure
+
+- `NodeGroupManager`: Main class handling cloud-agnostic operations
+- `ScalingOperation`: Dataclass representing a scaling operation
+- `CloudProvider`: Enum for supported cloud providers
+- `_manage_aws_node_groups()`: AWS-specific implementation
+- `_manage_gcp_node_groups()`: GCP-specific implementation
+
+## License
+
+(Add license information if applicable)
+
+## Contributing
+
+(Add contribution guidelines if applicable)
 
 ## Support
 
-For detailed error information, check the logs in `/tmp/node_group_manager/`.
+For issues or questions, please check the logs in `/tmp/node_group_manager/` for detailed error information.
 
-## Docker Image
-
-The Node Group Manager is available as a multi-architecture Docker image supporting both `amd64` and `arm64` platforms. The image is automatically built and pushed to Docker Hub on every push to the main branch and when tags are created.
-
-### Image Details
-- Repository: `jjjulllesss/wake-up-cloud`
-- Architectures: `amd64`, `arm64`
-- Size: ~150MB
-- Auto-updates: On every main branch push and tag
-
-### Manual Pull
-
-If you want to manually pull the image:
-```bash
-# Pull the latest version
-docker pull jjjulllesss/wake-up-cloud:latest
-
-# Pull a specific version
-docker pull jjjulllesss/wake-up-cloud:v1.0.0
-```
-
-### Running Manually
-
-You can also run the container directly with Docker:
-
-```bash
-# For AWS
-docker run -it --rm \
-    -v ~/.aws:/home/appuser/.aws:ro \
-    -e AWS_DEFAULT_REGION \
-    -e AWS_ACCESS_KEY_ID \
-    -e AWS_SECRET_ACCESS_KEY \
-    -e AWS_SESSION_TOKEN \
-    -v /tmp:/tmp \
-    jjjulllesss/wake-up-cloud:latest --cluster-name my-cluster --cloud aws --account 123456789012
-
-# For GCP
-docker run -it --rm \
-    -v ~/.config/gcloud:/home/appuser/.config/gcloud:ro \
-    -e GOOGLE_APPLICATION_CREDENTIALS=/home/appuser/.config/gcloud/application_default_credentials.json \
-    -v /tmp:/tmp \
-    jjjulllesss/wake-up-cloud:latest --cluster-name my-cluster --cloud gcp --account my-project
-```
-
-### Image Size Optimization
-
-The multi-arch image uses a multi-stage build process to minimize the final image size:
-- Base image: ~40MB
-- AWS CLI: ~10MB
-- GCP SDK: ~100MB
-- Application code: ~1MB
-- Total size: ~150MB 
