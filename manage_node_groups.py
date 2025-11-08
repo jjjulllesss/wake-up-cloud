@@ -63,11 +63,11 @@ console_handler.setFormatter(logging.Formatter(
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
-# Log startup information
-logger.info("Starting Node Group Manager")
-logger.info("Log file: %s", log_file)
-logger.info("Python version: %s", sys.version)
-logger.info("Working directory: %s", os.getcwd())
+# Log startup information (detailed info goes to file, minimal to console)
+logger.debug("Starting Node Group Manager")
+logger.debug("Log file: %s", log_file)
+logger.debug("Python version: %s", sys.version)
+logger.debug("Working directory: %s", os.getcwd())
 
 class CloudProvider(Enum):
     """Supported cloud providers."""
@@ -110,13 +110,6 @@ class NodeGroupManager:
             region: AWS region (required for AWS)
             dry_run: If True, only show what would be changed
         """
-        logger.info("Initializing NodeGroupManager")
-        logger.info("Cluster name: %s", cluster_name)
-        logger.info("Cloud provider: %s", cloud_provider)
-        logger.info("Account: %s", account)
-        logger.info("Region: %s", region)
-        logger.info("Dry run mode: %s", dry_run)
-        
         self.cluster_name = cluster_name
         self.cloud_provider = CloudProvider(cloud_provider.lower())
         self.account = account
@@ -124,9 +117,23 @@ class NodeGroupManager:
         self.dry_run = dry_run
         self.operations: List[ScalingOperation] = []
         
-        logger.info("Validating inputs...")
+        # Log configuration (detailed to file, summary to console)
+        logger.debug("Initializing NodeGroupManager")
+        logger.debug("Cluster name: %s", cluster_name)
+        logger.debug("Cloud provider: %s", cloud_provider)
+        logger.debug("Account: %s", account)
+        logger.debug("Region: %s", region)
+        logger.debug("Dry run mode: %s", dry_run)
+        
+        logger.info(f"Managing node groups for cluster: {cluster_name} ({cloud_provider.upper()})")
+        if self.region:
+            logger.info(f"Region: {region}")
+        if self.dry_run:
+            logger.info("DRY RUN MODE - No changes will be made")
+        
+        logger.debug("Validating inputs...")
         self.validate_inputs()
-        logger.info("Input validation completed successfully")
+        logger.debug("Input validation completed successfully")
 
     @property
     def tag_name(self) -> str:
@@ -308,19 +315,21 @@ class NodeGroupManager:
         Raises:
             Exception: If client creation fails
         """
-        logger.info("Creating AWS client for service: %s", service_name)
+        logger.debug("Creating AWS client for service: %s", service_name)
         try:
             # Create a session to use the default credential provider chain
             session = boto3.Session()
             
-            # Log which credential source is being used
-            credentials = session.get_credentials()
-            if credentials.token:
-                logger.info("Using AWS session credentials (likely from CloudShell)")
-            elif credentials.access_key:
-                logger.info("Using AWS access key credentials")
-            else:
-                logger.info("Using default AWS credential provider chain")
+            # Log which credential source is being used (only once, on first client creation)
+            if not hasattr(self, '_aws_credentials_logged'):
+                credentials = session.get_credentials()
+                if credentials.token:
+                    logger.debug("Using AWS session credentials (likely from CloudShell)")
+                elif credentials.access_key:
+                    logger.debug("Using AWS access key credentials")
+                else:
+                    logger.debug("Using default AWS credential provider chain")
+                self._aws_credentials_logged = True
             
             # Create client with the session
             return session.client(service_name, region_name=self.region)
@@ -338,11 +347,18 @@ class NodeGroupManager:
             operation: The scaling operation to add
         """
         self.operations.append(operation)
-        logger.info(
-            f"{'[DRY RUN] ' if self.dry_run else ''}Planning to scale {operation.resource_name} "
-            f"from {operation.current_size} to {operation.target_size} nodes "
-            f"(min={operation.min_size}, max={operation.max_size})"
-        )
+        if self.dry_run:
+            logger.info(
+                f"[DRY RUN] Would scale {operation.resource_name} "
+                f"from {operation.current_size} to {operation.target_size} nodes "
+                f"(min={operation.min_size}, max={operation.max_size})"
+            )
+        else:
+            logger.debug(
+                f"Planning to scale {operation.resource_name} "
+                f"from {operation.current_size} to {operation.target_size} nodes "
+                f"(min={operation.min_size}, max={operation.max_size})"
+            )
 
     def _execute_operations(self) -> None:
         """Execute all planned scaling operations.
@@ -371,18 +387,18 @@ class NodeGroupManager:
             ValueError: If tag parsing fails
         """
         try:
-            logger.info(f"Starting AWS node group management for cluster: {self.cluster_name}")
-            logger.info(f"Using AWS region: {self.region}")
+            logger.debug(f"Starting AWS node group management for cluster: {self.cluster_name}")
             
             # Get AWS clients
             autoscaling = self._get_aws_client('autoscaling')
             ec2 = self._get_aws_client('ec2')
             
             # Get all ASGs
-            logger.info("Fetching Auto Scaling Groups...")
+            logger.info("Searching for Auto Scaling Groups...")
             paginator = autoscaling.get_paginator('describe_auto_scaling_groups')
             asg_count = 0
             matching_asg_count = 0
+            processed_count = 0
             
             for page in paginator.paginate():
                 for asg in page['AutoScalingGroups']:
@@ -393,7 +409,7 @@ class NodeGroupManager:
                     # Check if ASG name contains cluster name
                     if self.cluster_name in asg_name:
                         matching_asg_count += 1
-                        logger.info(f"Found matching ASG: {asg_name}")
+                        logger.debug(f"Found matching ASG: {asg_name}")
                         try:
                             off_hours_previous = None
                             
@@ -401,7 +417,7 @@ class NodeGroupManager:
                             for tag in asg['Tags']:
                                 if tag['Key'] == self.tag_name:
                                     off_hours_previous = tag['Value']
-                                    logger.info(f"Found {self.tag_name} tag with value: {off_hours_previous}")
+                                    logger.debug(f"Found {self.tag_name} tag with value: {off_hours_previous}")
                                     break
                             
                             if off_hours_previous:
@@ -421,17 +437,16 @@ class NodeGroupManager:
                                     
                                     # Execute operation if not in dry run mode
                                     if not self.dry_run:
-                                        logger.info(f"Updating scaling parameters for ASG: {asg_name}")
+                                        logger.info(f"  → Updating {asg_name}: scaling from {asg['DesiredCapacity']} to {desired_capacity} nodes (min={min_size}, max={max_size})")
                                         autoscaling.update_auto_scaling_group(
                                             AutoScalingGroupName=asg_name,
                                             MinSize=min_size,
                                             MaxSize=max_size,
                                             DesiredCapacity=desired_capacity
                                         )
-                                        logger.info(f"Successfully updated scaling parameters for {asg_name}")
+                                        logger.info(f"  ✓ Successfully updated {asg_name}")
                                         
                                         # Remove the OffHoursPrevious tag after successful update
-                                        logger.info(f"Removing {self.tag_name} tag from ASG: {asg_name}")
                                         autoscaling.delete_tags(
                                             Tags=[
                                                 {
@@ -441,23 +456,52 @@ class NodeGroupManager:
                                                 }
                                             ]
                                         )
-                                        logger.info(f"Successfully removed {self.tag_name} tag from {asg_name}")
+                                        logger.debug(f"Removed {self.tag_name} tag from {asg_name}")
+                                        processed_count += 1
                                     
                                 except ValueError as e:
                                     logger.error(f"Error parsing scaling values for ASG {asg_name}: {str(e)}")
                                     continue
                             else:
-                                logger.info(f"No {self.tag_name} tag found for ASG: {asg_name}")
+                                logger.debug(f"No {self.tag_name} tag found for ASG: {asg_name}")
                             
                         except ClientError as e:
                             logger.error(f"Error processing ASG {asg_name}: {str(e)}")
                     else:
                         logger.debug(f"Skipping non-matching ASG: {asg_name}")
             
-            logger.info(f"Processed {asg_count} total ASGs")
-            logger.info(f"Found {matching_asg_count} ASGs matching cluster name: {self.cluster_name}")
-            if matching_asg_count == 0:
-                logger.warning(f"No ASGs found matching cluster name: {self.cluster_name}")
+            # Summary
+            logger.info("")
+            logger.info("=" * 60)
+            if self.dry_run:
+                logger.info("SUMMARY (DRY RUN - No changes were made)")
+            else:
+                logger.info("SUMMARY")
+            logger.info("=" * 60)
+            logger.info(f"Total ASGs scanned: {asg_count}")
+            logger.info(f"ASGs matching cluster '{self.cluster_name}': {matching_asg_count}")
+            
+            if self.dry_run:
+                # In dry run, count operations that would be performed (filter by AWS provider)
+                aws_operations = [op for op in self.operations if op.provider == CloudProvider.AWS]
+                would_update_count = len(aws_operations)
+                if would_update_count > 0:
+                    logger.info(f"ASGs that would be updated: {would_update_count}")
+                    for op in aws_operations:
+                        logger.info(f"  - {op.resource_name}: {op.current_size} → {op.target_size} nodes (min={op.min_size}, max={op.max_size})")
+                elif matching_asg_count > 0:
+                    logger.info("No ASGs would be updated (no OffHoursPrevious tags found)")
+                else:
+                    logger.warning(f"No ASGs found matching cluster name: {self.cluster_name}")
+            else:
+                # Normal execution
+                if processed_count > 0:
+                    logger.info(f"ASGs successfully updated: {processed_count}")
+                elif matching_asg_count > 0:
+                    logger.info("No ASGs required updates (no OffHoursPrevious tags found)")
+                else:
+                    logger.warning(f"No ASGs found matching cluster name: {self.cluster_name}")
+            logger.info("=" * 60)
                         
         except ClientError as e:
             logger.error(f"AWS API error: {str(e)}")
@@ -488,10 +532,10 @@ class NodeGroupManager:
             operation_response = client.get_operation(request=operation_request)
             
             if operation_response.status == container_v1.Operation.Status.DONE:
-                logger.info("Operation completed successfully.")
+                logger.debug("Operation completed successfully.")
                 return
             elif operation_response.status == container_v1.Operation.Status.RUNNING:
-                logger.info("Operation is still running...")
+                logger.debug("Operation is still running...")
                 time.sleep(5)
             elif operation_response.status == container_v1.Operation.Status.ABORTING:
                 logger.warning("Operation is aborting.")
@@ -516,20 +560,70 @@ class NodeGroupManager:
             ValueError: If tag parsing fails
         """
         try:
+            logger.debug(f"Starting GCP node group management for cluster: {self.cluster_name}")
+            
             client = container_v1.ClusterManagerClient()
             project_id = self.account
             parent = f"projects/{project_id}/locations/-"
             
             try:
+                logger.info("Searching for GKE clusters...")
                 clusters = client.list_clusters(parent=parent)
+                
+                cluster_found = False
+                node_pool_count = 0
+                matching_node_pool_count = 0
+                processed_count = 0
                 
                 for cluster in clusters.clusters:
                     if cluster.name == self.cluster_name:
+                        cluster_found = True
+                        logger.debug(f"Found matching cluster: {cluster.name} in {cluster.location}")
+                        node_pool_count = len(cluster.node_pools)
+                        
                         for node_pool in cluster.node_pools:
+                            matching_node_pool_count += 1
                             try:
-                                self._process_gcp_node_pool(client, project_id, cluster, node_pool)
+                                was_processed = self._process_gcp_node_pool(client, project_id, cluster, node_pool)
+                                if was_processed:
+                                    processed_count += 1
                             except google_exceptions.GoogleAPIError as e:
                                 logger.error(f"Error processing node pool {node_pool.name}: {str(e)}")
+                        
+                        break
+                
+                # Summary
+                logger.info("")
+                logger.info("=" * 60)
+                if self.dry_run:
+                    logger.info("SUMMARY (DRY RUN - No changes were made)")
+                else:
+                    logger.info("SUMMARY")
+                logger.info("=" * 60)
+                if cluster_found:
+                    logger.info(f"Cluster found: {self.cluster_name}")
+                    logger.info(f"Total node pools in cluster: {node_pool_count}")
+                    logger.info(f"Node pools processed: {matching_node_pool_count}")
+                    
+                    if self.dry_run:
+                        # In dry run, count operations that would be performed (filter by GCP provider)
+                        gcp_operations = [op for op in self.operations if op.provider == CloudProvider.GCP]
+                        would_update_count = len(gcp_operations)
+                        if would_update_count > 0:
+                            logger.info(f"Node pools that would be updated: {would_update_count}")
+                            for op in gcp_operations:
+                                logger.info(f"  - {op.resource_name}: {op.current_size} → {op.target_size} nodes (min={op.min_size}, max={op.max_size})")
+                        elif matching_node_pool_count > 0:
+                            logger.info("No node pools would be updated (no offhoursprevious labels found)")
+                    else:
+                        # Normal execution
+                        if processed_count > 0:
+                            logger.info(f"Node pools successfully updated: {processed_count}")
+                        elif matching_node_pool_count > 0:
+                            logger.info("No node pools required updates (no offhoursprevious labels found)")
+                else:
+                    logger.warning(f"Cluster '{self.cluster_name}' not found in project '{project_id}'")
+                logger.info("=" * 60)
                                 
             except google_exceptions.GoogleAPIError as e:
                 logger.error(f"Error listing clusters: {str(e)}")
@@ -539,7 +633,7 @@ class NodeGroupManager:
             logger.error(f"GCP API error: {str(e)}")
             raise
 
-    def _process_gcp_node_pool(self, client: container_v1.ClusterManagerClient, project_id: str, cluster: Any, node_pool: Any) -> None:
+    def _process_gcp_node_pool(self, client: container_v1.ClusterManagerClient, project_id: str, cluster: Any, node_pool: Any) -> bool:
         """Process a single GCP node pool.
         
         Args:
@@ -547,6 +641,9 @@ class NodeGroupManager:
             project_id: The GCP project ID
             cluster: The GKE cluster
             node_pool: The node pool to process
+            
+        Returns:
+            bool: True if the node pool was processed/updated, False otherwise
         """
         node_pool_name = f"projects/{project_id}/locations/{cluster.location}/clusters/{cluster.name}/nodePools/{node_pool.name}"
         node_pool_details = client.get_node_pool(name=node_pool_name)
@@ -566,13 +663,13 @@ class NodeGroupManager:
                 labels=container_v1.NodeLabels(labels=current_labels)
             )
             operation = client.update_node_pool(request=update_request)
-            logger.info(f"Storing current configuration for node pool {node_pool.name}")
+            logger.debug(f"Storing current configuration for node pool {node_pool.name}")
             self._wait_for_operation(client, project_id, cluster.location, operation.name.split('/')[-1])
         
         # Check for offhoursprevious in labels
         if self.tag_name in node_pool_details.config.labels:
             off_hours_previous = node_pool_details.config.labels[self.tag_name]
-            logger.info(f"Found {self.tag_name} tag for node pool: {node_pool.name}")
+            logger.debug(f"Found {self.tag_name} label for node pool: {node_pool.name}")
             
             try:
                 max_size, desired_capacity, min_size = self._parse_scaling_values(off_hours_previous)
@@ -590,13 +687,20 @@ class NodeGroupManager:
                 
                 # Execute operation if not in dry run mode
                 if not self.dry_run:
+                    logger.info(f"  → Updating {node_pool.name}: scaling from {node_pool.initial_node_count} to {desired_capacity} nodes (min={min_size}, max={max_size})")
                     self._execute_gcp_scaling(client, node_pool_name, project_id, cluster.location, 
                                            desired_capacity, min_size, max_size, current_labels)
+                    logger.info(f"  ✓ Successfully updated {node_pool.name}")
+                    return True
+                else:
+                    return True
                     
             except ValueError as e:
                 logger.error(f"Error parsing scaling values for node pool {node_pool.name}: {str(e)}")
             except google_exceptions.GoogleAPIError as e:
                 logger.error(f"Error updating node pool {node_pool.name}: {str(e)}")
+        
+        return False
 
     def _execute_gcp_scaling(self, client: container_v1.ClusterManagerClient, node_pool_name: str, 
                            project_id: str, location: str, desired_capacity: int, 
@@ -619,7 +723,7 @@ class NodeGroupManager:
             node_count=desired_capacity
         )
         operation = client.set_node_pool_size(request=size_request)
-        logger.info(f"Setting node pool size to {desired_capacity}")
+        logger.debug(f"Setting node pool size to {desired_capacity}")
         self._wait_for_operation(client, project_id, location, operation.name.split('/')[-1])
         
         # Enable autoscaling
@@ -632,7 +736,7 @@ class NodeGroupManager:
             )
         )
         operation = client.set_node_pool_autoscaling(request=autoscaling_request)
-        logger.info("Enabling autoscaling")
+        logger.debug("Enabling autoscaling")
         self._wait_for_operation(client, project_id, location, operation.name.split('/')[-1])
         
         # Remove the offhoursprevious label
@@ -642,7 +746,7 @@ class NodeGroupManager:
             labels=container_v1.NodeLabels(labels=current_labels)
         )
         operation = client.update_node_pool(request=update_request)
-        logger.info(f"Removing {self.tag_name} label")
+        logger.debug(f"Removing {self.tag_name} label")
         self._wait_for_operation(client, project_id, location, operation.name.split('/')[-1])
 
 def main():
