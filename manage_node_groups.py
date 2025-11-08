@@ -215,20 +215,44 @@ class NodeGroupManager:
             )
 
     def _parse_aws_format(self, value: str) -> Dict[str, int]:
-        """Parse AWS format tag value."""
+        """Parse AWS format tag value.
+        
+        Handles random order of parameters in the tag value.
+        Looks for keys containing 'maxsize', 'minsize', or 'desiredcapacity'
+        regardless of their position in the string.
+        """
         values = {}
         for param in value.split(';'):
-            key, val = param.split('=')
-            key = key.strip()
-            if 'max' in key:
-                values['max'] = int(val)
-            elif 'min' in key:
-                values['min'] = int(val)
-            elif 'desired' in key:
-                values['desired'] = int(val)
+            param = param.strip()
+            if not param:
+                continue
+            try:
+                key, val = param.split('=', 1)
+                key = key.strip().lower()
+                val = val.strip()
+                
+                # Match keys regardless of order - look for specific patterns
+                if 'maxsize' in key or (key.startswith('max') and 'size' in key):
+                    values['max'] = int(val)
+                elif 'minsize' in key or (key.startswith('min') and 'size' in key):
+                    values['min'] = int(val)
+                elif 'desiredcapacity' in key or ('desired' in key and 'capacity' in key):
+                    values['desired'] = int(val)
+                else:
+                    logger.warning(f"Unrecognized key in AWS tag format: {key}")
+            except ValueError as e:
+                logger.warning(f"Error parsing parameter '{param}': {str(e)}")
+                continue
         
         if len(values) != 3:
-            raise ValueError("Missing required values in AWS format")
+            missing = []
+            if 'max' not in values:
+                missing.append('MaxSize')
+            if 'min' not in values:
+                missing.append('MinSize')
+            if 'desired' not in values:
+                missing.append('DesiredCapacity')
+            raise ValueError(f"Missing required values in AWS format: {', '.join(missing)}")
         return values
 
     def _parse_gcp_format(self, value: str) -> Dict[str, int]:
@@ -631,6 +655,7 @@ def main():
     4. Handles errors and exits appropriately
     """
     parser = argparse.ArgumentParser(
+        prog='python3 manage_node_groups.py',
         description='Manage Kubernetes node groups scaling for AWS and GCP clusters',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -639,23 +664,23 @@ def main():
     parser.add_argument(
         '--cluster-name',
         required=True,
-        help='Name of the Kubernetes cluster to manage'
+        help='Name of the Kubernetes cluster to manage (REQUIRED)'
     )
     parser.add_argument(
         '--cloud',
         required=True,
         choices=['aws', 'gcp'],
-        help='Cloud provider (aws or gcp)'
+        help='Cloud provider: aws or gcp (REQUIRED)'
     )
     parser.add_argument(
         '--account',
-        help='AWS account ID or GCP project ID (required for GCP)'
+        help='AWS account ID or GCP project ID (REQUIRED for GCP)'
     )
     
     # Optional arguments
     parser.add_argument(
         '--region',
-        help='AWS region (required for AWS)'
+        help='AWS region (REQUIRED for AWS)'
     )
     parser.add_argument(
         '--dry-run',

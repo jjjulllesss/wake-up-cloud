@@ -41,7 +41,7 @@ A Python tool to manage Kubernetes node group scaling for AWS and GCP clusters. 
 Download the script, install dependencies, and get started with a single command:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/jjjulllesss/wake-up-cloud/main/manage_node_groups.py -o manage_node_groups.py && curl -sSL https://raw.githubusercontent.com/jjjulllesss/wake-up-cloud/main/requirements.txt -o requirements.txt && pip3 install -q -r requirements.txt && chmod +x manage_node_groups.py && echo "✅ Installation complete!\n" && python3 manage_node_groups.py --help
+curl -sSL https://raw.githubusercontent.com/jjjulllesss/wake-up-cloud/main/manage_node_groups.py -o manage_node_groups.py && curl -sSL https://raw.githubusercontent.com/jjjulllesss/wake-up-cloud/main/requirements.txt -o requirements.txt && pip3 install -q -r requirements.txt && chmod +x manage_node_groups.py && echo '✅ Installation complete!' && python3 manage_node_groups.py --help
 ```
 
 ### Manual Installation
