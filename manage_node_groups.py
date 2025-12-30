@@ -21,17 +21,18 @@ import argparse
 import logging
 import sys
 import time
-import re
 import os
 import tempfile
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Tuple, Any
 from dataclasses import dataclass
 from enum import Enum
 from logging.handlers import RotatingFileHandler
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
 from botocore.exceptions import ClientError
 from google.cloud import container_v1
+from google.cloud import compute_v1
 from google.api_core import exceptions as google_exceptions
 
 # Configure logging
@@ -100,7 +101,7 @@ class ValidationError(Exception):
 class NodeGroupManager:
     """Main class for managing node groups across cloud providers."""
     
-    def __init__(self, cluster_name: str, cloud_provider: str, account: str = None, region: str = None, dry_run: bool = False):
+    def __init__(self, cluster_name: str, cloud_provider: str, account: str = None, region: str = None, dry_run: bool = False, scale_down: bool = False):
         """Initialize the node group manager.
         
         Args:
@@ -109,12 +110,14 @@ class NodeGroupManager:
             account: AWS account ID or GCP project ID (required for GCP)
             region: AWS region (required for AWS)
             dry_run: If True, only show what would be changed
+            scale_down: If True, scale down to 0 and save current state
         """
         self.cluster_name = cluster_name
         self.cloud_provider = CloudProvider(cloud_provider.lower())
         self.account = account
         self.region = region
         self.dry_run = dry_run
+        self.scale_down = scale_down
         self.operations: List[ScalingOperation] = []
         
         # Log configuration (detailed to file, summary to console)
@@ -124,12 +127,15 @@ class NodeGroupManager:
         logger.debug("Account: %s", account)
         logger.debug("Region: %s", region)
         logger.debug("Dry run mode: %s", dry_run)
+        logger.debug("Scale down mode: %s", scale_down)
         
         logger.info(f"Managing node groups for cluster: {cluster_name} ({cloud_provider.upper()})")
         if self.region:
             logger.info(f"Region: {region}")
         if self.dry_run:
             logger.info("DRY RUN MODE - No changes will be made")
+        if self.scale_down:
+            logger.info("SCALE DOWN MODE - Will scale to 0 and save current state")
         
         logger.debug("Validating inputs...")
         self.validate_inputs()
@@ -348,11 +354,18 @@ class NodeGroupManager:
         """
         self.operations.append(operation)
         if self.dry_run:
-            logger.info(
-                f"[DRY RUN] Would scale {operation.resource_name} "
-                f"from {operation.current_size} to {operation.target_size} nodes "
-                f"(min={operation.min_size}, max={operation.max_size})"
-            )
+            if self.scale_down and operation.target_size == 0:
+                logger.info(
+                    f"[DRY RUN] Would scale down {operation.resource_name} "
+                    f"from {operation.current_size} to 0 nodes "
+                    f"and save state (min={operation.min_size}, max={operation.max_size}, desired={operation.current_size})"
+                )
+            else:
+                logger.info(
+                    f"[DRY RUN] Would scale {operation.resource_name} "
+                    f"from {operation.current_size} to {operation.target_size} nodes "
+                    f"(min={operation.min_size}, max={operation.max_size})"
+                )
         else:
             logger.debug(
                 f"Planning to scale {operation.resource_name} "
@@ -360,27 +373,91 @@ class NodeGroupManager:
                 f"(min={operation.min_size}, max={operation.max_size})"
             )
 
-    def _execute_operations(self) -> None:
-        """Execute all planned scaling operations.
+    def _process_aws_asg(self, asg: Dict) -> bool:
+        """Process a single AWS ASG (scale down or scale up).
         
-        This method executes all operations that were added to the operations list.
-        In dry run mode, it only logs the operations without making any changes.
+        Args:
+            asg: ASG dictionary from describe_auto_scaling_groups
+            
+        Returns:
+            bool: True if the ASG was processed, False otherwise
         """
-        if self.dry_run:
-            logger.info("Dry run completed. No changes were made.")
-            return
-
-        for operation in self.operations:
-            logger.info(f"Executing scaling operation for {operation.resource_name}")
-            # Implementation of actual scaling operations...
+        asg_name = asg['AutoScalingGroupName']
+        autoscaling = self._get_aws_client('autoscaling')
+        
+        try:
+            if self.scale_down:
+                # Scale down mode: save current state and scale to 0
+                return self._scale_down_aws_asg(autoscaling, asg, asg_name)
+            else:
+                # Scale up mode: restore from OffHoursPrevious tag
+                off_hours_previous = None
+                
+                # Find OffHoursPrevious tag
+                for tag in asg['Tags']:
+                    if tag['Key'] == self.tag_name:
+                        off_hours_previous = tag['Value']
+                        logger.debug(f"Found {self.tag_name} tag with value: {off_hours_previous}")
+                        break
+                
+                if off_hours_previous:
+                    try:
+                        max_size, desired_capacity, min_size = self._parse_scaling_values(off_hours_previous)
+                        
+                        # Add operation to the list
+                        operation = ScalingOperation(
+                            resource_name=asg_name,
+                            current_size=asg['DesiredCapacity'],
+                            target_size=desired_capacity,
+                            min_size=min_size,
+                            max_size=max_size,
+                            provider=CloudProvider.AWS
+                        )
+                        self._add_operation(operation)
+                        
+                        # Execute operation if not in dry run mode
+                        if not self.dry_run:
+                            logger.info(f"  → Updating {asg_name}: scaling from {asg['DesiredCapacity']} to {desired_capacity} nodes (min={min_size}, max={max_size})")
+                            autoscaling.update_auto_scaling_group(
+                                AutoScalingGroupName=asg_name,
+                                MinSize=min_size,
+                                MaxSize=max_size,
+                                DesiredCapacity=desired_capacity
+                            )
+                            logger.info(f"  ✓ Successfully updated {asg_name}")
+                            
+                            # Remove the OffHoursPrevious tag after successful update
+                            autoscaling.delete_tags(
+                                Tags=[
+                                    {
+                                        'ResourceId': asg_name,
+                                        'ResourceType': 'auto-scaling-group',
+                                        'Key': self.tag_name
+                                    }
+                                ]
+                            )
+                            logger.debug(f"Removed {self.tag_name} tag from {asg_name}")
+                            return True
+                        else:
+                            return True
+                        
+                    except ValueError as e:
+                        logger.error(f"Error parsing scaling values for ASG {asg_name}: {str(e)}")
+                        return False
+                else:
+                    logger.debug(f"No {self.tag_name} tag found for ASG: {asg_name}")
+                    return False
+                
+        except ClientError as e:
+            logger.error(f"Error processing ASG {asg_name}: {str(e)}")
+            return False
 
     def _manage_aws_node_groups(self) -> None:
         """Manage AWS Auto Scaling Groups for the specified cluster.
         
         This method:
-        1. Finds all ASGs matching the cluster name
-        2. Checks for OffHoursPrevious tags
-        3. Updates scaling parameters based on tag values
+        - If scale_down=True: Saves current state and scales down to 0
+        - If scale_down=False: Checks for OffHoursPrevious tags and scales up
         
         Raises:
             ClientError: If AWS API calls fail
@@ -391,14 +468,12 @@ class NodeGroupManager:
             
             # Get AWS clients
             autoscaling = self._get_aws_client('autoscaling')
-            ec2 = self._get_aws_client('ec2')
             
             # Get all ASGs
             logger.info("Searching for Auto Scaling Groups...")
             paginator = autoscaling.get_paginator('describe_auto_scaling_groups')
             asg_count = 0
-            matching_asg_count = 0
-            processed_count = 0
+            matching_asgs = []
             
             for page in paginator.paginate():
                 for asg in page['AutoScalingGroups']:
@@ -408,67 +483,26 @@ class NodeGroupManager:
                     
                     # Check if ASG name contains cluster name
                     if self.cluster_name in asg_name:
-                        matching_asg_count += 1
+                        matching_asgs.append(asg)
                         logger.debug(f"Found matching ASG: {asg_name}")
+            
+            matching_asg_count = len(matching_asgs)
+            
+            # Process ASGs in parallel
+            processed_count = 0
+            if matching_asgs:
+                logger.info(f"Processing {matching_asg_count} ASGs in parallel...")
+                with ThreadPoolExecutor(max_workers=10) as executor:
+                    futures = {executor.submit(self._process_aws_asg, asg): asg for asg in matching_asgs}
+                    
+                    for future in as_completed(futures):
+                        asg = futures[future]
                         try:
-                            off_hours_previous = None
-                            
-                            # Find OffHoursPrevious tag
-                            for tag in asg['Tags']:
-                                if tag['Key'] == self.tag_name:
-                                    off_hours_previous = tag['Value']
-                                    logger.debug(f"Found {self.tag_name} tag with value: {off_hours_previous}")
-                                    break
-                            
-                            if off_hours_previous:
-                                try:
-                                    max_size, desired_capacity, min_size = self._parse_scaling_values(off_hours_previous)
-                                    
-                                    # Add operation to the list
-                                    operation = ScalingOperation(
-                                        resource_name=asg_name,
-                                        current_size=asg['DesiredCapacity'],
-                                        target_size=desired_capacity,
-                                        min_size=min_size,
-                                        max_size=max_size,
-                                        provider=CloudProvider.AWS
-                                    )
-                                    self._add_operation(operation)
-                                    
-                                    # Execute operation if not in dry run mode
-                                    if not self.dry_run:
-                                        logger.info(f"  → Updating {asg_name}: scaling from {asg['DesiredCapacity']} to {desired_capacity} nodes (min={min_size}, max={max_size})")
-                                        autoscaling.update_auto_scaling_group(
-                                            AutoScalingGroupName=asg_name,
-                                            MinSize=min_size,
-                                            MaxSize=max_size,
-                                            DesiredCapacity=desired_capacity
-                                        )
-                                        logger.info(f"  ✓ Successfully updated {asg_name}")
-                                        
-                                        # Remove the OffHoursPrevious tag after successful update
-                                        autoscaling.delete_tags(
-                                            Tags=[
-                                                {
-                                                    'ResourceId': asg_name,
-                                                    'ResourceType': 'auto-scaling-group',
-                                                    'Key': self.tag_name
-                                                }
-                                            ]
-                                        )
-                                        logger.debug(f"Removed {self.tag_name} tag from {asg_name}")
-                                        processed_count += 1
-                                    
-                                except ValueError as e:
-                                    logger.error(f"Error parsing scaling values for ASG {asg_name}: {str(e)}")
-                                    continue
-                            else:
-                                logger.debug(f"No {self.tag_name} tag found for ASG: {asg_name}")
-                            
-                        except ClientError as e:
-                            logger.error(f"Error processing ASG {asg_name}: {str(e)}")
-                    else:
-                        logger.debug(f"Skipping non-matching ASG: {asg_name}")
+                            was_processed = future.result()
+                            if was_processed:
+                                processed_count += 1
+                        except Exception as e:
+                            logger.error(f"Error processing ASG {asg['AutoScalingGroupName']}: {str(e)}")
             
             # Summary
             logger.info("")
@@ -488,9 +522,15 @@ class NodeGroupManager:
                 if would_update_count > 0:
                     logger.info(f"ASGs that would be updated: {would_update_count}")
                     for op in aws_operations:
-                        logger.info(f"  - {op.resource_name}: {op.current_size} → {op.target_size} nodes (min={op.min_size}, max={op.max_size})")
+                        if self.scale_down:
+                            logger.info(f"  - {op.resource_name}: {op.current_size} → 0 nodes (saving state: min={op.min_size}, max={op.max_size}, desired={op.current_size})")
+                        else:
+                            logger.info(f"  - {op.resource_name}: {op.current_size} → {op.target_size} nodes (min={op.min_size}, max={op.max_size})")
                 elif matching_asg_count > 0:
-                    logger.info("No ASGs would be updated (no OffHoursPrevious tags found)")
+                    if self.scale_down:
+                        logger.info("No ASGs would be updated (already at 0 or no matching ASGs)")
+                    else:
+                        logger.info("No ASGs would be updated (no OffHoursPrevious tags found)")
                 else:
                     logger.warning(f"No ASGs found matching cluster name: {self.cluster_name}")
             else:
@@ -498,7 +538,10 @@ class NodeGroupManager:
                 if processed_count > 0:
                     logger.info(f"ASGs successfully updated: {processed_count}")
                 elif matching_asg_count > 0:
-                    logger.info("No ASGs required updates (no OffHoursPrevious tags found)")
+                    if self.scale_down:
+                        logger.info("No ASGs required updates (already at 0 or no matching ASGs)")
+                    else:
+                        logger.info("No ASGs required updates (no OffHoursPrevious tags found)")
                 else:
                     logger.warning(f"No ASGs found matching cluster name: {self.cluster_name}")
             logger.info("=" * 60)
@@ -506,6 +549,69 @@ class NodeGroupManager:
         except ClientError as e:
             logger.error(f"AWS API error: {str(e)}")
             raise
+
+    def _scale_down_aws_asg(self, autoscaling, asg: Dict, asg_name: str) -> bool:
+        """Scale down an AWS ASG to 0 and save current state.
+        
+        Args:
+            autoscaling: AWS autoscaling client
+            asg: ASG dictionary from describe_auto_scaling_groups
+            asg_name: Name of the ASG
+            
+        Returns:
+            bool: True if the ASG was processed, False otherwise
+        """
+        current_min = asg['MinSize']
+        current_max = asg['MaxSize']
+        current_desired = asg['DesiredCapacity']
+        
+        # Check if already at 0
+        if current_desired == 0 and current_min == 0 and current_max == 0:
+            logger.debug(f"ASG {asg_name} is already scaled down to 0")
+            return False
+        
+        # Create tag value in AWS format
+        tag_value = f"MaxSize={current_max};DesiredCapacity={current_desired};MinSize={current_min}"
+        
+        # Add operation to the list
+        operation = ScalingOperation(
+            resource_name=asg_name,
+            current_size=current_desired,
+            target_size=0,
+            min_size=current_min,
+            max_size=current_max,
+            provider=CloudProvider.AWS
+        )
+        self._add_operation(operation)
+        
+        if not self.dry_run:
+            # Save current state to tag
+            logger.info(f"  → Saving state for {asg_name}: min={current_min}, max={current_max}, desired={current_desired}")
+            autoscaling.create_or_update_tags(
+                Tags=[
+                    {
+                        'ResourceId': asg_name,
+                        'ResourceType': 'auto-scaling-group',
+                        'Key': self.tag_name,
+                        'Value': tag_value,
+                        'PropagateAtLaunch': False
+                    }
+                ]
+            )
+            logger.debug(f"Saved current state to {self.tag_name} tag: {tag_value}")
+            
+            # Scale down to 0
+            logger.info(f"  → Scaling down {asg_name} to 0 nodes")
+            autoscaling.update_auto_scaling_group(
+                AutoScalingGroupName=asg_name,
+                MinSize=0,
+                MaxSize=0,
+                DesiredCapacity=0
+            )
+            logger.info(f"  ✓ Successfully scaled down {asg_name} to 0")
+            return True
+        
+        return True
 
     def _wait_for_operation(self, client: container_v1.ClusterManagerClient, project_id: str, location: str, operation_name: str, timeout_seconds: int = 600) -> None:
         """Wait for a GKE operation to complete.
@@ -531,17 +637,30 @@ class NodeGroupManager:
             )
             operation_response = client.get_operation(request=operation_request)
             
-            if operation_response.status == container_v1.Operation.Status.DONE:
+            # Handle status as both enum and integer for compatibility
+            status = operation_response.status
+            status_value = status.value if hasattr(status, 'value') else int(status)
+            
+            # Status enum values: STATUS_UNSPECIFIED=0, PENDING=1, RUNNING=2, DONE=3, ABORTING=4
+            if status_value == 3 or status == container_v1.Operation.Status.DONE:
                 logger.debug("Operation completed successfully.")
                 return
-            elif operation_response.status == container_v1.Operation.Status.RUNNING:
+            elif status_value == 2 or status == container_v1.Operation.Status.RUNNING:
                 logger.debug("Operation is still running...")
                 time.sleep(5)
-            elif operation_response.status == container_v1.Operation.Status.ABORTING:
+            elif status_value == 1 or status == container_v1.Operation.Status.PENDING:
+                logger.debug("Operation is pending...")
+                time.sleep(5)
+            elif status_value == 4 or status == container_v1.Operation.Status.ABORTING:
                 logger.warning("Operation is aborting.")
                 return
+            elif status_value == 0:
+                # STATUS_UNSPECIFIED - treat as pending and continue waiting
+                logger.debug("Operation status unspecified, continuing to wait...")
+                time.sleep(5)
             else:
-                logger.error(f"Unexpected operation status: {operation_response.status}")
+                # Log as warning instead of error for unknown but potentially valid statuses
+                logger.warning(f"Unknown operation status: {status_value} (operation: {operation_name})")
                 time.sleep(5)
 
         raise TimeoutError(f"Operation {operation_name} timed out after {timeout_seconds} seconds.")
@@ -550,10 +669,8 @@ class NodeGroupManager:
         """Manage GCP node pools for the specified cluster.
         
         This method:
-        1. Connects to the GKE API
-        2. Finds the specified cluster
-        3. Updates node pool configurations
-        4. Handles scaling operations
+        - If scale_down=True: Saves current state and scales down to 0
+        - If scale_down=False: Checks for offhoursprevious labels and scales up
         
         Raises:
             google_exceptions.GoogleAPIError: If GCP API calls fail
@@ -580,15 +697,25 @@ class NodeGroupManager:
                         cluster_found = True
                         logger.debug(f"Found matching cluster: {cluster.name} in {cluster.location}")
                         node_pool_count = len(cluster.node_pools)
+                        matching_node_pool_count = node_pool_count
                         
-                        for node_pool in cluster.node_pools:
-                            matching_node_pool_count += 1
-                            try:
-                                was_processed = self._process_gcp_node_pool(client, project_id, cluster, node_pool)
-                                if was_processed:
-                                    processed_count += 1
-                            except google_exceptions.GoogleAPIError as e:
-                                logger.error(f"Error processing node pool {node_pool.name}: {str(e)}")
+                        # Process node pools in parallel
+                        if cluster.node_pools:
+                            logger.info(f"Processing {node_pool_count} node pools in parallel...")
+                            with ThreadPoolExecutor(max_workers=5) as executor:
+                                futures = {executor.submit(self._process_gcp_node_pool, client, project_id, cluster, node_pool): node_pool 
+                                          for node_pool in cluster.node_pools}
+                                
+                                for future in as_completed(futures):
+                                    node_pool = futures[future]
+                                    try:
+                                        was_processed = future.result()
+                                        if was_processed:
+                                            processed_count += 1
+                                    except google_exceptions.GoogleAPIError as e:
+                                        logger.error(f"Error processing node pool {node_pool.name}: {str(e)}")
+                                    except Exception as e:
+                                        logger.error(f"Unexpected error processing node pool {node_pool.name}: {str(e)}")
                         
                         break
                 
@@ -612,15 +739,24 @@ class NodeGroupManager:
                         if would_update_count > 0:
                             logger.info(f"Node pools that would be updated: {would_update_count}")
                             for op in gcp_operations:
-                                logger.info(f"  - {op.resource_name}: {op.current_size} → {op.target_size} nodes (min={op.min_size}, max={op.max_size})")
+                                if self.scale_down:
+                                    logger.info(f"  - {op.resource_name}: {op.current_size} → 0 nodes (saving state: min={op.min_size}, max={op.max_size}, desired={op.current_size})")
+                                else:
+                                    logger.info(f"  - {op.resource_name}: {op.current_size} → {op.target_size} nodes (min={op.min_size}, max={op.max_size})")
                         elif matching_node_pool_count > 0:
-                            logger.info("No node pools would be updated (no offhoursprevious labels found)")
+                            if self.scale_down:
+                                logger.info("No node pools would be updated (already at 0 or no matching node pools)")
+                            else:
+                                logger.info("No node pools would be updated (no offhoursprevious labels found)")
                     else:
                         # Normal execution
                         if processed_count > 0:
                             logger.info(f"Node pools successfully updated: {processed_count}")
                         elif matching_node_pool_count > 0:
-                            logger.info("No node pools required updates (no offhoursprevious labels found)")
+                            if self.scale_down:
+                                logger.info("No node pools required updates (already at 0 or no matching node pools)")
+                            else:
+                                logger.info("No node pools required updates (no offhoursprevious labels found)")
                 else:
                     logger.warning(f"Cluster '{self.cluster_name}' not found in project '{project_id}'")
                 logger.info("=" * 60)
@@ -648,63 +784,200 @@ class NodeGroupManager:
         node_pool_name = f"projects/{project_id}/locations/{cluster.location}/clusters/{cluster.name}/nodePools/{node_pool.name}"
         node_pool_details = client.get_node_pool(name=node_pool_name)
         
-        # Store current configuration
+        if self.scale_down:
+            # Scale down mode: save current state and scale to 0
+            return self._scale_down_gcp_node_pool(client, node_pool_name, project_id, cluster, node_pool, node_pool_details)
+        else:
+            # Scale up mode: restore from offhoursprevious label
+            current_labels = dict(node_pool_details.config.labels)
+            
+            # Check for offhoursprevious in labels
+            if self.tag_name in node_pool_details.config.labels:
+                off_hours_previous = node_pool_details.config.labels[self.tag_name]
+                logger.debug(f"Found {self.tag_name} label for node pool: {node_pool.name}")
+                
+                try:
+                    max_size, desired_capacity, min_size = self._parse_scaling_values(off_hours_previous)
+                    
+                    # Add operation to the list
+                    operation = ScalingOperation(
+                        resource_name=node_pool.name,
+                        current_size=node_pool.initial_node_count,
+                        target_size=desired_capacity,
+                        min_size=min_size,
+                        max_size=max_size,
+                        provider=CloudProvider.GCP
+                    )
+                    self._add_operation(operation)
+                    
+                    # Execute operation if not in dry run mode
+                    if not self.dry_run:
+                        logger.info(f"  → Updating {node_pool.name}: scaling from {node_pool.initial_node_count} to {desired_capacity} nodes (min={min_size}, max={max_size})")
+                        self._execute_gcp_scaling(client, node_pool_name, project_id, cluster.location, 
+                                               desired_capacity, min_size, max_size, current_labels, node_pool=node_pool)
+                        logger.info(f"  ✓ Successfully updated {node_pool.name}")
+                        return True
+                    else:
+                        return True
+                        
+                except ValueError as e:
+                    logger.error(f"Error parsing scaling values for node pool {node_pool.name}: {str(e)}")
+                except google_exceptions.GoogleAPIError as e:
+                    logger.error(f"Error updating node pool {node_pool.name}: {str(e)}")
+            
+            return False
+
+    def _resize_single_instance_group(self, project_id: str, instance_group_url: str, target_size: int) -> None:
+        """Resize a single GCP instance group.
+        
+        Args:
+            project_id: The GCP project ID
+            instance_group_url: The instance group URL
+            target_size: Target size for the instance group
+        """
+        # Parse the instance group URL to extract zone and name
+        # Format: https://www.googleapis.com/compute/v1/projects/PROJECT/zones/ZONE/instanceGroupManagers/NAME
+        url_parts = instance_group_url.split('/')
+        if len(url_parts) < 9:
+            logger.warning(f"Invalid instance group URL format: {instance_group_url}")
+            return
+        
+        zone = url_parts[8]  # Zone is at index 8
+        igm_name = url_parts[-1]  # Name is the last part
+        
+        logger.debug(f"Resizing instance group {igm_name} in zone {zone} to {target_size}")
+        
+        if not self.dry_run:
+            with compute_v1.InstanceGroupManagersClient() as igm_client:
+                resize_request = compute_v1.ResizeInstanceGroupManagerRequest(
+                    instance_group_manager=igm_name,
+                    project=project_id,
+                    size=target_size,
+                    zone=zone
+                )
+                igm_resize_operation = igm_client.resize(request=resize_request)
+                logger.info(f"  → Resized instance group {igm_name} to {target_size}. Operation: {igm_resize_operation.name}")
+        else:
+            logger.info(f"  [DRY RUN] Would resize instance group {igm_name} to {target_size}")
+
+    def _resize_instance_groups(self, project_id: str, node_pool: Any, target_size: int) -> None:
+        """Resize GCP instance groups associated with a node pool in parallel.
+        
+        Args:
+            project_id: The GCP project ID
+            node_pool: The node pool object containing instance_group_urls
+            target_size: Target size for the instance groups (0 for scale down)
+        """
+        if not hasattr(node_pool, 'instance_group_urls') or not node_pool.instance_group_urls:
+            logger.debug(f"No instance group URLs found for node pool {node_pool.name}")
+            return
+        
+        instance_group_urls = node_pool.instance_group_urls
+        if len(instance_group_urls) == 1:
+            # Single instance group, no need for parallelization
+            self._resize_single_instance_group(project_id, instance_group_urls[0], target_size)
+        else:
+            # Multiple instance groups, process in parallel
+            logger.debug(f"Resizing {len(instance_group_urls)} instance groups in parallel...")
+            try:
+                with ThreadPoolExecutor(max_workers=len(instance_group_urls)) as executor:
+                    futures = {executor.submit(self._resize_single_instance_group, project_id, url, target_size): url 
+                              for url in instance_group_urls}
+                    
+                    for future in as_completed(futures):
+                        url = futures[future]
+                        try:
+                            future.result()
+                        except google_exceptions.GoogleAPIError as e:
+                            logger.error(f"Error resizing instance group {url}: {str(e)}")
+                        except Exception as e:
+                            logger.error(f"Unexpected error resizing instance group {url}: {str(e)}")
+            except Exception as e:
+                logger.error(f"Error resizing instance groups: {str(e)}")
+                raise
+
+    def _scale_down_gcp_node_pool(self, client: container_v1.ClusterManagerClient, node_pool_name: str, 
+                                  project_id: str, cluster: Any, node_pool: Any, node_pool_details: Any) -> bool:
+        """Scale down a GCP node pool to 0 and save current state.
+        
+        Args:
+            client: The GKE ClusterManagerClient
+            node_pool_name: Full name of the node pool
+            project_id: The GCP project ID
+            cluster: The GKE cluster
+            node_pool: The node pool object
+            node_pool_details: The detailed node pool information
+            
+        Returns:
+            bool: True if the node pool was processed, False otherwise
+        """
+        # Get current scaling values (handle case where autoscaling is disabled)
+        if node_pool.autoscaling and node_pool.autoscaling.enabled:
+            current_min = node_pool.autoscaling.min_node_count
+            current_max = node_pool.autoscaling.max_node_count
+        else:
+            # Autoscaling is disabled, use initial_node_count for both min and max
+            current_min = node_pool.initial_node_count
+            current_max = node_pool.initial_node_count
+        
+        current_desired = node_pool.initial_node_count
+        
+        # Check if already at 0
+        if current_desired == 0 and current_min == 0 and current_max == 0:
+            logger.debug(f"Node pool {node_pool.name} is already scaled down to 0")
+            return False
+        
+        # Get current labels for saving state
         current_labels = dict(node_pool_details.config.labels)
-        current_labels[self.tag_name] = (
-            f"maxsize{node_pool.autoscaling.max_node_count}-"
-            f"desiredcapacity{node_pool.initial_node_count}-"
-            f"minsize{node_pool.autoscaling.min_node_count}"
+        
+        # Create label value in GCP format
+        label_value = (
+            f"maxsize{current_max}-"
+            f"desiredcapacity{current_desired}-"
+            f"minsize{current_min}"
         )
         
-        # Update labels if not in dry run mode
+        # Add operation to the list
+        operation = ScalingOperation(
+            resource_name=node_pool.name,
+            current_size=current_desired,
+            target_size=0,
+            min_size=current_min,
+            max_size=current_max,
+            provider=CloudProvider.GCP
+        )
+        self._add_operation(operation)
+        
         if not self.dry_run:
+            # Save current state to label
+            logger.info(f"  → Saving state for {node_pool.name}: min={current_min}, max={current_max}, desired={current_desired}")
+            current_labels[self.tag_name] = label_value
             update_request = container_v1.UpdateNodePoolRequest(
                 name=node_pool_name,
                 labels=container_v1.NodeLabels(labels=current_labels)
             )
             operation = client.update_node_pool(request=update_request)
-            logger.debug(f"Storing current configuration for node pool {node_pool.name}")
+            logger.debug(f"Saved current state to {self.tag_name} label: {label_value}")
             self._wait_for_operation(client, project_id, cluster.location, operation.name.split('/')[-1])
-        
-        # Check for offhoursprevious in labels
-        if self.tag_name in node_pool_details.config.labels:
-            off_hours_previous = node_pool_details.config.labels[self.tag_name]
-            logger.debug(f"Found {self.tag_name} label for node pool: {node_pool.name}")
             
-            try:
-                max_size, desired_capacity, min_size = self._parse_scaling_values(off_hours_previous)
-                
-                # Add operation to the list
-                operation = ScalingOperation(
-                    resource_name=node_pool.name,
-                    current_size=node_pool.initial_node_count,
-                    target_size=desired_capacity,
-                    min_size=min_size,
-                    max_size=max_size,
-                    provider=CloudProvider.GCP
-                )
-                self._add_operation(operation)
-                
-                # Execute operation if not in dry run mode
-                if not self.dry_run:
-                    logger.info(f"  → Updating {node_pool.name}: scaling from {node_pool.initial_node_count} to {desired_capacity} nodes (min={min_size}, max={max_size})")
-                    self._execute_gcp_scaling(client, node_pool_name, project_id, cluster.location, 
-                                           desired_capacity, min_size, max_size, current_labels)
-                    logger.info(f"  ✓ Successfully updated {node_pool.name}")
-                    return True
-                else:
-                    return True
-                    
-            except ValueError as e:
-                logger.error(f"Error parsing scaling values for node pool {node_pool.name}: {str(e)}")
-            except google_exceptions.GoogleAPIError as e:
-                logger.error(f"Error updating node pool {node_pool.name}: {str(e)}")
+            # Scale down to 0
+            logger.info(f"  → Scaling down {node_pool.name} to 0 nodes")
+            self._execute_gcp_scaling(client, node_pool_name, project_id, cluster.location, 
+                                    0, 0, 0, current_labels, remove_label=False)
+            
+            # Resize instance groups to 0
+            logger.info(f"  → Resizing instance groups for {node_pool.name} to 0")
+            self._resize_instance_groups(project_id, node_pool, 0)
+            
+            logger.info(f"  ✓ Successfully scaled down {node_pool.name} to 0")
+            return True
         
-        return False
+        return True
 
     def _execute_gcp_scaling(self, client: container_v1.ClusterManagerClient, node_pool_name: str, 
                            project_id: str, location: str, desired_capacity: int, 
-                           min_size: int, max_size: int, current_labels: Dict[str, str]) -> None:
+                           min_size: int, max_size: int, current_labels: Dict[str, str], 
+                           remove_label: bool = True, node_pool: Any = None) -> None:
         """Execute GCP node pool scaling operations.
         
         Args:
@@ -716,6 +989,8 @@ class NodeGroupManager:
             min_size: Minimum number of nodes
             max_size: Maximum number of nodes
             current_labels: Current node pool labels
+            remove_label: If True, remove the offhoursprevious label after scaling (default: True)
+            node_pool: The node pool object (optional, needed for instance group scaling)
         """
         # Set node pool size
         size_request = container_v1.SetNodePoolSizeRequest(
@@ -726,28 +1001,47 @@ class NodeGroupManager:
         logger.debug(f"Setting node pool size to {desired_capacity}")
         self._wait_for_operation(client, project_id, location, operation.name.split('/')[-1])
         
-        # Enable autoscaling
-        autoscaling_request = container_v1.SetNodePoolAutoscalingRequest(
-            name=node_pool_name,
-            autoscaling=container_v1.NodePoolAutoscaling(
-                enabled=True,
-                min_node_count=min_size,
-                max_node_count=max_size
+        # Enable autoscaling (or disable if min=max=0)
+        if min_size == 0 and max_size == 0:
+            # Disable autoscaling when scaling to 0
+            autoscaling_request = container_v1.SetNodePoolAutoscalingRequest(
+                name=node_pool_name,
+                autoscaling=container_v1.NodePoolAutoscaling(
+                    enabled=False
+                )
             )
-        )
+            logger.debug("Disabling autoscaling (scaled to 0)")
+        else:
+            # Enable autoscaling with specified limits
+            autoscaling_request = container_v1.SetNodePoolAutoscalingRequest(
+                name=node_pool_name,
+                autoscaling=container_v1.NodePoolAutoscaling(
+                    enabled=True,
+                    min_node_count=min_size,
+                    max_node_count=max_size
+                )
+            )
+            logger.debug("Enabling autoscaling")
         operation = client.set_node_pool_autoscaling(request=autoscaling_request)
-        logger.debug("Enabling autoscaling")
         self._wait_for_operation(client, project_id, location, operation.name.split('/')[-1])
         
-        # Remove the offhoursprevious label
-        current_labels.pop(self.tag_name, None)
-        update_request = container_v1.UpdateNodePoolRequest(
-            name=node_pool_name,
-            labels=container_v1.NodeLabels(labels=current_labels)
-        )
-        operation = client.update_node_pool(request=update_request)
-        logger.debug(f"Removing {self.tag_name} label")
-        self._wait_for_operation(client, project_id, location, operation.name.split('/')[-1])
+        # Resize instance groups if node_pool is provided and we're scaling up (not to 0)
+        if node_pool and desired_capacity > 0:
+            logger.info(f"  → Resizing instance groups to {desired_capacity}")
+            # Get updated node pool to ensure we have the latest instance_group_urls
+            updated_node_pool = client.get_node_pool(name=node_pool_name)
+            self._resize_instance_groups(project_id, updated_node_pool, desired_capacity)
+        
+        # Remove the offhoursprevious label if requested (only in scale-up mode)
+        if remove_label:
+            current_labels.pop(self.tag_name, None)
+            update_request = container_v1.UpdateNodePoolRequest(
+                name=node_pool_name,
+                labels=container_v1.NodeLabels(labels=current_labels)
+            )
+            operation = client.update_node_pool(request=update_request)
+            logger.debug(f"Removing {self.tag_name} label")
+            self._wait_for_operation(client, project_id, location, operation.name.split('/')[-1])
 
 def main():
     """Main entry point for the script.
@@ -792,6 +1086,11 @@ def main():
         help='Show what would be changed without making actual changes'
     )
     parser.add_argument(
+        '--scale-down',
+        action='store_true',
+        help='Scale down to 0 and save current state (opposite of scale up)'
+    )
+    parser.add_argument(
         '--verbose', '-v',
         action='count',
         default=0,
@@ -812,7 +1111,8 @@ def main():
             cloud_provider=args.cloud,
             account=args.account,
             region=args.region,
-            dry_run=args.dry_run
+            dry_run=args.dry_run,
+            scale_down=args.scale_down
         )
         manager.manage_node_groups()
     except ValidationError as e:
