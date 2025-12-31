@@ -643,13 +643,13 @@ class NodeGroupManager:
             
             # Status enum values: STATUS_UNSPECIFIED=0, PENDING=1, RUNNING=2, DONE=3, ABORTING=4
             if status_value == 3 or status == container_v1.Operation.Status.DONE:
-                logger.debug("Operation completed successfully.")
+                logger.info("Operation completed successfully.")
                 return
             elif status_value == 2 or status == container_v1.Operation.Status.RUNNING:
-                logger.debug("Operation is still running...")
+                logger.info("Operation is still running...")
                 time.sleep(5)
             elif status_value == 1 or status == container_v1.Operation.Status.PENDING:
-                logger.debug("Operation is pending...")
+                logger.info("Operation is pending...")
                 time.sleep(5)
             elif status_value == 4 or status == container_v1.Operation.Status.ABORTING:
                 logger.warning("Operation is aborting.")
